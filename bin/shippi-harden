@@ -719,6 +719,7 @@ replace_managed_block() {
 # "no usable key" on a box that had a perfectly good authorized_keys.
 have_usable_key() {
   local found=1 f
+  local root="${2:-}"
   while IFS= read -r f; do
     [[ -n $f && -s $f ]] || continue
     # sshd's StrictModes (on by default) silently IGNORES an authorized_keys
@@ -728,7 +729,7 @@ have_usable_key() {
     # accept - and the difference is the difference between "you can still get
     # in" and "you cannot". Check the same way sshd does, so this cannot report
     # a key is usable when it is not.
-    key_strict_modes_ok "$f" || continue
+    key_strict_modes_ok "$f" "$root" || continue
     # A private key is not a usable authorized_keys entry. ssh-keygen -l will
     # happily print a fingerprint for one, because it can read the public half
     # embedded in it, so it has to be rejected explicitly.
@@ -780,6 +781,15 @@ key_strict_modes_ok() {
   # blocks --lockdown-ssh on an entirely legitimate setup. The kernel's view
   # is what sshd uses, so ask for that. -L does the same for the walk.
   local d dircount=0
+  # Tests pass their fixture root as $2 so a runner whose own HOME is
+  # group-writable cannot make a valid key look unusable. Production passes
+  # one argument and walks to /, the chain sshd checks. A parameter, not an
+  # environment variable: nothing inherited from the environment can shorten
+  # that walk.
+  local stop="${2:-/}"
+  if [[ $stop != / ]]; then
+    stop="$(readlink -f "$stop" 2>/dev/null || printf '%s' "$stop")"
+  fi
   # Resolve the FILE itself, not just its parent. `pwd -P` canonicalises the
   # directory, so a symlinked authorized_keys kept a clean link-path while
   # `find -L "$f"` only checked the target file's own mode - the target's
@@ -822,6 +832,9 @@ key_strict_modes_ok() {
       return 1
     fi
     [[ $d == "/" ]] && break
+    if [[ $d == "$stop" ]]; then
+      break
+    fi
     d="$(dirname "$d")"
   done
   # The file itself, which is not a directory on the walk above.

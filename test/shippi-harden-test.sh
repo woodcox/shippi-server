@@ -8,6 +8,12 @@
 #
 # Run: ./test/shippi-harden-test.sh
 set -uo pipefail
+# GitHub's runner starts with umask 002, which made fixture keys and .ssh
+# directories group-writable. sshd refuses those keys, so the tests that
+# expect a valid key to be accepted failed on the fixture's mode rather than
+# the code's. Pin the umask; the StrictModes tests set the bad modes they
+# deliberately test.
+umask 022
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$TEST_DIR/bin/shippi-harden"
@@ -369,12 +375,13 @@ test_no_lockout_with_second_path_only() {
   setup_destdir
   local home; home="$(mktemp -d)"
   mkdir -p "$home/.ssh"
+  chmod 700 "$home" "$home/.ssh"
   ssh-keygen -q -t ed25519 -N '' -C 'second@shippi' -f "$home/id" </dev/null >/dev/null 2>&1
   cp "$home/id.pub" "$home/.ssh/authorized_keys2"
   chmod 600 "$home/.ssh/authorized_keys2"
 
   local rc=0
-  have_usable_key "$(printf '%s\n' "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2")" || rc=1
+  have_usable_key "$(printf '%s\n' "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2")" "$home" || rc=1
   rm -rf "$home"
   teardown_destdir
   return $rc
@@ -412,7 +419,8 @@ test_usable_key_accepts_real_key() {
   local f; f="$(mktemp -d)"
   ssh-keygen -q -t ed25519 -N '' -C 'test@shippi' -f "$f/id" </dev/null >/dev/null 2>&1 || return 1
   cat "$f/id.pub" >"$f/authorized_keys"
-  have_usable_key "$f/authorized_keys"
+  chmod 600 "$f/authorized_keys"
+  have_usable_key "$f/authorized_keys" "$f"
   local rc=$?
   rm -rf "$f"
   return $rc
@@ -1050,29 +1058,54 @@ test_strictmodes_rejects_what_sshd_would_refuse() {
 
   chmod 700 "$t/home" "$t/home/.ssh"
   chmod 600 "$k"
-  key_strict_modes_ok "$k" || { printf '        a correctly-permissioned key was rejected\n'; rc=1; }
+  key_strict_modes_ok "$k" "$t" || { printf '        a correctly-permissioned key was rejected\n'; rc=1; }
 
   chmod 664 "$k"
-  if key_strict_modes_ok "$k"; then
+  if key_strict_modes_ok "$k" "$t"; then
     printf '        authorized_keys at 664 was accepted; sshd would ignore it\n'
     rc=1
   fi
   chmod 600 "$k"
 
   chmod 777 "$t/home/.ssh"
-  if key_strict_modes_ok "$k"; then
+  if key_strict_modes_ok "$k" "$t"; then
     printf '        a world-writable .ssh was accepted; sshd would ignore the key\n'
     rc=1
   fi
   chmod 700 "$t/home/.ssh"
 
   chmod 775 "$t/home"
-  if key_strict_modes_ok "$k"; then
+  if key_strict_modes_ok "$k" "$t"; then
     printf '        a group-writable home was accepted; sshd would ignore the key\n'
     rc=1
   fi
 
   rm -rf "$t"
+  return $rc
+}
+
+test_strict_root_canonicalizes_a_symlinked_fixture() {
+  # TMPDIR can itself contain a symlink, so the fixture root passed to
+  # key_strict_modes_ok can differ textually from the canonical $d the walk
+  # builds. Without resolving the root, the stop never matches and the walk
+  # reaches the writable parent below the fixture.
+  local rc=0 base writable fixture link k
+  base="$(mktemp -d)"
+  writable="$base/writable"
+  mkdir "$writable"
+  chmod 777 "$writable"
+  fixture="$writable/fixture"
+  mkdir -p "$fixture/home/.ssh"
+  chmod 700 "$fixture" "$fixture/home" "$fixture/home/.ssh"
+  ssh-keygen -q -t ed25519 -N '' -f "$fixture/home/.ssh/id" -C t >/dev/null 2>&1
+  cp "$fixture/home/.ssh/id.pub" "$fixture/home/.ssh/authorized_keys"
+  k="$fixture/home/.ssh/authorized_keys"
+  chmod 600 "$k"
+  link="$base/link"
+  ln -s "$fixture" "$link"
+
+  key_strict_modes_ok "$k" "$link" || rc=1
+  rm -rf "$base"
   return $rc
 }
 
@@ -2691,8 +2724,18 @@ test_sysctl_file_has_no_bogus_keys() {
   setup_destdir
   configure_sysctl >/dev/null 2>&1
   local f="$CONF_DEST/etc/sysctl.d/99-shippi-hardening.conf"
-  local bad
-  bad="$(sysctl -p "$f" 2>&1 | grep -vi 'permission denied' || true)"
+  local bad out
+  if ! command -v sysctl >/dev/null 2>&1; then
+    printf '        sysctl is not installed; the generated file was not parsed\n'
+    teardown_destdir
+    return 1
+  fi
+  out="$(sysctl -p "$f" 2>&1 || true)"
+  # `sysctl -p` applies and prints every key; a read-only /proc/sys adds
+  # "ignoring: Read-only file system", and a non-root run adds permission
+  # errors. Anything else is an unexpected parser error and fails the test.
+  bad="$(printf '%s\n' "$out" |
+    grep -Eiv 'permission denied|read-only file system|^[^[:space:]]+ = ' || true)"
   if [[ -n $bad ]]; then
     printf '        %s\n' "$bad"
   fi
@@ -5247,6 +5290,7 @@ t 'docker/tailscale/github-cli stay out of unattended'  test_third_party_repos_a
 t 'held-back packages are parsed out of apt'          test_held_back_packages_are_named
 t 'the held-back warning reaches the output'          test_held_back_warning_reaches_the_output
 t 'StrictModes rejects what sshd would refuse'        test_strictmodes_rejects_what_sshd_would_refuse
+t 'StrictModes canonicalizes a symlinked fixture'     test_strict_root_canonicalizes_a_symlinked_fixture
 t 'key_files_for_user splits multiple paths'         test_key_files_for_user_splits_multiple_paths
 t '%U expands to the numeric uid'                    test_key_files_expands_percent_U_to_the_numeric_uid
 t 'a failing awk in the Port rewrite is not silent'  test_a_failing_awk_in_the_port_rewrite_is_not_silent

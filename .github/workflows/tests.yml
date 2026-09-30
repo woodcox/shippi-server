@@ -1,0 +1,148 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Allow a manual run without pushing a commit.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          # arm64 leg: the script is a Raspberry Pi hardening script, so arm64
+          # is the architecture that actually matters, and this repo is public
+          # so the runner is free. Verified against GitHub's docs: arm64 Linux
+          # hosted runners (ubuntu-24.04-arm) are free on public repositories
+          # and bill private ones. This repo is public (a fork of
+          # omacom/omaterm), so the label is valid here.
+          #
+          # If this repo is ever made private, this label HARD FAILS the
+          # workflow rather than skipping - GitHub does not silently ignore an
+          # unavailable label, it errors. Remove this line in that case.
+          - ubuntu-24.04-arm
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/shippi-harden-test.log"
+
+          # `tee` keeps the suite's own "  ok  /  FAIL" lines and the final
+          # "N passed, M failed" summary visible in the runner log, while we
+          # also capture them for the follow-up step.
+          set +e
+          bash test/shippi-harden-test.sh 2>&1 | tee "$log"
+          rc="${PIPESTATUS[0]}"
+          set -e
+
+          # A zero exit is meaningless if the suite died before printing its
+          # summary, so the summary line itself is a hard requirement.
+          if ! grep -Eq '[0-9]+ passed, [0-9]+ failed' "$log"; then
+            echo "::error::the suite printed no 'N passed, M failed' summary (exit $rc): it died before finishing"
+            exit 1
+          fi
+
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::the suite failed (exit $rc); see the ok/FAIL lines above"
+            exit "$rc"
+          fi
+
+      - name: Surface host-dependent tests that vacuous-skipped
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/shippi-harden-test.log"
+          if [[ ! -f $log ]]; then
+            echo "::error::no test log at $log; the suite did not run"
+            exit 1
+          fi
+          skipped=0
+          missing=0
+
+          # One row per test the workflow must verify: name | what the runner is
+          # missing when the test's gate is closed. A non-empty second field is
+          # a host-dependent test whose body `return 0` (a vacuous skip) when
+          # the prerequisite is absent, so the workflow re-checks the gate and
+          # warns. A blank second field is a test that FAILS rather than skips
+          # (missing sysctl keys, missing apt-config); it is presence-checked
+          # only, because a green "ok" cannot happen there.
+          checks=(
+            "this box authorized_keys parses|a non-empty ~/.ssh/authorized_keys"
+            "the rpi archive is auto-updated where present|archive.raspberrypi.com in /etc/apt"
+            "running kernel owner resolves on this box|/boot/vmlinuz-$(uname -r)"
+            "an untracked kernel image is detected|the dpkg binary"
+            "initrd/cmdline are not false positives|the dpkg binary"
+            "apt config origins match this OS release|VERSION_CODENAME in /etc/os-release"
+            "apt accepts the generated config|"
+            "every sysctl key exists on this kernel|"
+          )
+
+          gate_ok() {
+            case "$1" in
+              'this box authorized_keys parses') [[ -s "$HOME/.ssh/authorized_keys" ]] ;;
+              'the rpi archive is auto-updated where present')
+                grep -rqs 'archive\.raspberrypi\.com' \
+                  /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null
+                ;;
+              'running kernel owner resolves on this box')
+                [[ -f "/boot/vmlinuz-$(uname -r)" ]]
+                ;;
+              'an untracked kernel image is detected'|'initrd/cmdline are not false positives')
+                command -v dpkg >/dev/null 2>&1
+                ;;
+              'apt config origins match this OS release')
+                [[ -n $(awk -F= '/^VERSION_CODENAME=/{gsub(/"/, "", $2); print $2}' \
+                  /etc/os-release 2>/dev/null) ]]
+                ;;
+              *) return 0 ;;
+            esac
+          }
+
+          for row in "${checks[@]}"; do
+            name="${row%%|*}"
+            need="${row#*|}"
+            if [[ -n $need ]] && ! gate_ok "$name"; then
+              echo "::warning::VACUOUS SKIP: '$name'"
+              echo "           runner is missing: $need"
+              skipped=$((skipped + 1))
+            fi
+            if ! grep -Fq "$name" "$log"; then
+              echo "::error::'$name' never appeared in the suite output"
+              missing=$((missing + 1))
+            fi
+          done
+
+          if [[ $skipped -gt 0 ]]; then
+            echo ""
+            echo "============================================================"
+            echo "NOTICE: $skipped host-dependent test(s) vacuous-skipped here."
+            echo "        A green check does NOT prove those paths on a real Pi."
+            echo "============================================================"
+          fi
+
+          if [[ $missing -gt 0 ]]; then
+            echo "::error::$missing host-dependent test name(s) were missing from the output"
+            exit 1
+          fi

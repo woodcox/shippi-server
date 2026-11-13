@@ -3306,6 +3306,35 @@ EOF
   return $rc
 }
 
+test_ssh_access_removes_protocolless_blanket_rules() {
+  # `ufw allow 22` is broader than `ufw allow 22/tcp`: it permits both TCP and
+  # UDP. Deleting only the /tcp form leaves SSH publicly reachable.
+  setup_destdir
+  DRY_RUN=0
+  SSH_FROM=(192.168.50.0/24)
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_ssh_access 1199
+
+  grep -qE '^ufw delete allow 1199$' "$log" || {
+    printf '        protocol-less allow rule was not removed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  grep -qE '^ufw delete limit 1199$' "$log" || {
+    printf '        protocol-less limit rule was not removed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  grep -qE '^ufw delete allow 1199/tcp$' "$log" || rc=1
+  grep -qE '^ufw delete limit 1199/tcp$' "$log" || rc=1
+  teardown_destdir
+  return $rc
+}
+
 test_ssh_from_replaces_previous_scoped_rules() {
   # Running once with --ssh-from A and later with --ssh-from B must remove A.
   # The old permit otherwise keeps an excluded network able to log in.
@@ -4361,6 +4390,7 @@ t 'a public WAN is not treated as the LAN'              test_lan_cidrs_does_not_
 t 'ssh access is scoped, not blanket'                   test_ssh_access_is_scoped_and_removes_the_blanket_rule
 t 'tailnet-only closes the blanket when lan is unknown' test_ssh_access_closes_blanket_when_only_tailnet_is_known
 t '--ssh-from replaces auto-detection'                  test_ssh_from_overrides_lan_detection
+t 'protocol-less blanket ssh rules are removed'         test_ssh_access_removes_protocolless_blanket_rules
 t 'managed ssh rules are parsed by ownership'           test_ufw_managed_ssh_sources_reads_only_ours
 t 'stale ssh rules are removed, requested kept'         test_remove_stale_managed_ssh_rules_keeps_requested
 t 'tailnet-only removes every managed ssh rule'         test_tailnet_only_removes_all_managed_ssh_rules

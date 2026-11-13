@@ -207,9 +207,10 @@ Some deliberate choices worth knowing before you run it:
   affected.
 - **SSH is not exposed to the world after a successful run.** The firewall task
   rate-limits SSH from the LAN prefixes on the interface carrying the default
-  route, and allows it on `tailscale0`; it removes the blanket
-  `ufw allow <port>/tcp` and `ufw limit <port>/tcp` rules written by earlier
-  versions, and it removes scoped permits left by an earlier `--ssh-from`
+  route, and allows it on `tailscale0`; it removes the blanket `ufw allow`
+  and `ufw limit` rules for both `<port>/tcp` and protocol-unspecified
+  `<port>` written by earlier versions, and it removes scoped permits left by
+  an earlier `--ssh-from`
   choice. If no usable LAN or tailnet permit can be established, the firewall
   task stops before changing the default policy; if a requested source fails,
   it keeps the existing blanket rule and reports the task incomplete. If no LAN

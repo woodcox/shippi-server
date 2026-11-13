@@ -2605,6 +2605,21 @@ ufw_delete_rule() {
   return 1
 }
 
+# Delete every form of blanket SSH permit this script knows about.
+#
+# UFW matches deletion against the original rule specification, and a rule
+# written without a protocol (`ufw allow 22`) permits both TCP and UDP.
+# Deleting only `22/tcp` leaves that broader rule in place, so match both.
+remove_blanket_ssh_rules() {
+  local port="$1" kind spec rc=0
+  for kind in allow limit; do
+    for spec in "$port/tcp" "$port"; do
+      ufw_delete_rule "$kind" "$spec" || rc=1
+    done
+  done
+  return "$rc"
+}
+
 # CIDRs of scoped SSH permits this script previously added.
 #
 # `ufw show added` renders the exact command used to create each rule, so the
@@ -2753,11 +2768,9 @@ configure_ssh_access() {
     stale_failed=1
   fi
 
-  for kind in allow limit; do
-    if ! ufw_delete_rule "$kind" "$ssh_port/tcp"; then
-      broad_removed=0
-    fi
-  done
+  if ! remove_blanket_ssh_rules "$ssh_port"; then
+    broad_removed=0
+  fi
 
   local scope=""
   if ((${#SSH_LAN_APPLIED[@]})); then
@@ -2941,8 +2954,7 @@ configure_firewall() {
     if ! remove_stale_managed_ssh_rules "$ssh_port"; then
       lan_removed=0
     fi
-    ufw_delete_rule allow "$ssh_port/tcp" || broad_removed=0
-    ufw_delete_rule limit "$ssh_port/tcp" || broad_removed=0
+    remove_blanket_ssh_rules "$ssh_port" || broad_removed=0
     if ((lan_removed && broad_removed)); then
       ok "ssh is now reachable over tailscale0 only"
       warn "LAN logins to ${ssh_port} will be refused - make sure a tailscale session works"

@@ -109,7 +109,14 @@ setup_destdir() {
   # does not bail early on a box without unattended-upgrades installed, and
   # runs its own post-write checks.
   stub peek
-  peek() { return 1; }
+  peek() {
+    # No managed scoped SSH rules by default. Tests that care about stale
+    # permits override this with a `ufw show added` fixture.
+    case "$*" in
+      'ufw show added') return 0 ;;
+      *) return 1 ;;
+    esac
+  }
 }
 
 # Every function name a test stubs is recorded here so teardown_destdir can
@@ -2927,6 +2934,8 @@ test_firewall_loop_visits_every_port() {
   listening_ports() { printf 'tcp 80\ntcp 443\nudp 3478\n'; }
   stub current_ssh_port
   current_ssh_port() { printf '22\n'; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
   stub listening_process
   listening_process() { printf 'nginx\n'; }
   stub docker_present
@@ -2970,6 +2979,8 @@ test_firewall_skips_the_ssh_port() {
   listening_ports() { printf 'tcp 22\ntcp 80\n'; }
   stub current_ssh_port
   current_ssh_port() { printf '22\n'; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
   stub listening_process
   listening_process() { printf 'sshd\n'; }
   stub docker_present
@@ -3002,6 +3013,8 @@ test_firewall_no_deletes_an_existing_allow_rule() {
   listening_ports() { printf 'tcp 80\n'; }
   stub current_ssh_port
   current_ssh_port() { printf '22\n'; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
   stub listening_process
   listening_process() { printf 'nginx\n'; }
   stub docker_present
@@ -3213,6 +3226,188 @@ test_ssh_from_overrides_lan_detection() {
 
   grep -qF 'ufw limit from 192.168.50.0/24 to any port 1199 proto tcp' "$log" || rc=1
   ! grep -qF 'ufw limit from 10.0.0.0/8' "$log" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_ufw_managed_ssh_sources_reads_only_ours() {
+  # Stale-permit reconciliation must not delete a hand-written rule that
+  # happens to match the same source. The comment is the ownership marker.
+  setup_destdir
+  local rc=0 out
+  stub peek
+  peek() {
+    cat <<'EOF'
+Added user rules (see 'ufw status' for running firewall):
+ufw limit from 192.168.1.0/24 to any port 22 proto tcp comment 'shippi: ssh lan'
+ufw limit from 10.0.0.0/8 to any port 22 proto tcp comment 'someone else'
+ufw allow 22/tcp
+EOF
+  }
+  out="$(ufw_managed_ssh_sources 22)"
+  [[ $out == '192.168.1.0/24' ]] || {
+    printf '        unexpected managed sources: %s\n' "$out"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_remove_stale_managed_ssh_rules_keeps_requested() {
+  setup_destdir
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub peek
+  peek() {
+    cat <<'EOF'
+ufw limit from 192.168.1.0/24 to any port 1199 proto tcp comment 'shippi: ssh lan'
+ufw limit from 192.168.50.0/24 to any port 1199 proto tcp comment 'shippi: ssh lan'
+EOF
+  }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  remove_stale_managed_ssh_rules 1199 192.168.50.0/24
+
+  grep -qF 'ufw delete limit from 192.168.1.0/24 to any port 1199 proto tcp' "$log" || {
+    printf '        the stale scoped rule was not deleted:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  ! grep -qF 'ufw delete limit from 192.168.50.0/24 to any port 1199 proto tcp' "$log" || {
+    printf '        the requested scoped rule was deleted:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_tailnet_only_removes_all_managed_ssh_rules() {
+  setup_destdir
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub peek
+  peek() {
+    cat <<'EOF'
+ufw limit from 192.168.1.0/24 to any port 1199 proto tcp comment 'shippi: ssh lan'
+ufw limit from 192.168.50.0/24 to any port 1199 proto tcp comment 'shippi: ssh lan'
+EOF
+  }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  remove_stale_managed_ssh_rules 1199
+
+  grep -qF 'ufw delete limit from 192.168.1.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw delete limit from 192.168.50.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_from_replaces_previous_scoped_rules() {
+  # Running once with --ssh-from A and later with --ssh-from B must remove A.
+  # The old permit otherwise keeps an excluded network able to log in.
+  setup_destdir
+  DRY_RUN=0
+  SSH_FROM=(192.168.50.0/24)
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub peek
+  peek() {
+    printf '%s\n' "ufw limit from 192.168.1.0/24 to any port 1199 proto tcp comment 'shippi: ssh lan'"
+  }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_ssh_access 1199
+
+  grep -qF 'ufw limit from 192.168.50.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw delete limit from 192.168.1.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  ! grep -qF 'ufw delete limit from 192.168.50.0/24' "$log" || rc=1
+  local add_line del_line
+  add_line="$(grep -nF 'ufw limit from 192.168.50.0/24' "$log" | head -1 | cut -d: -f1)"
+  del_line="$(grep -nF 'ufw delete limit from 192.168.1.0/24' "$log" | head -1 | cut -d: -f1)"
+  [[ -n $add_line && -n $del_line && $add_line -lt $del_line ]] || {
+    printf '        the old permit was removed before the new one was added\n'
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_access_refuses_a_fresh_host_with_no_permit() {
+  # The lockout case: no LAN detection, no tailnet, no existing SSH rule. The
+  # firewall task must stop before default-deny and ufw enable.
+  setup_destdir
+  DRY_RUN=0
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub current_ssh_port
+  current_ssh_port() { printf '22\n'; }
+  stub listening_ports
+  listening_ports() { printf ''; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub lan_cidrs
+  lan_cidrs() { printf ''; }
+  stub have
+  have() { return 0; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub docker_published_by
+  docker_published_by() { printf ''; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_firewall >/dev/null 2>&1
+  local frc=$?
+
+  [[ $frc -eq 1 ]] || {
+    printf '        configure_firewall returned %s, expected failure\n' "$frc"
+    rc=1
+  }
+  ! grep -qF 'ufw default deny incoming' "$log" || {
+    printf '        default-deny was applied without an SSH permit:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_access_keeps_blanket_when_a_source_fails() {
+  # One failed source means the requested posture is incomplete. Removing the
+  # blanket rule now would drop that source while reporting success.
+  setup_destdir
+  DRY_RUN=0
+  SSH_FROM=(192.168.1.0/24 192.168.2.0/24)
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub run_root
+  run_root() {
+    printf '%s\n' "$*" >>"$log"
+    [[ $* == *'ufw limit from 192.168.2.0/24'* ]] && return 1
+    return 0
+  }
+
+  configure_ssh_access 1199
+  local src=$?
+
+  [[ $src -eq 1 ]] || {
+    printf '        configure_ssh_access returned %s, expected failure\n' "$src"
+    rc=1
+  }
+  grep -qF 'ufw limit from 192.168.1.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  ! grep -qF 'ufw delete allow 1199/tcp' "$log" || {
+    printf '        the blanket allow rule was removed after a source failed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  ! grep -qF 'ufw delete limit 1199/tcp' "$log" || {
+    printf '        the blanket limit rule was removed after a source failed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
   teardown_destdir
   return $rc
 }
@@ -4165,6 +4360,12 @@ t 'a public WAN is not treated as the LAN'              test_lan_cidrs_does_not_
 t 'ssh access is scoped, not blanket'                   test_ssh_access_is_scoped_and_removes_the_blanket_rule
 t 'unknown lan leaves the ssh rules alone'              test_ssh_access_leaves_the_blanket_rule_when_lan_is_unknown
 t '--ssh-from replaces auto-detection'                  test_ssh_from_overrides_lan_detection
+t 'managed ssh rules are parsed by ownership'           test_ufw_managed_ssh_sources_reads_only_ours
+t 'stale ssh rules are removed, requested kept'         test_remove_stale_managed_ssh_rules_keeps_requested
+t 'tailnet-only removes every managed ssh rule'         test_tailnet_only_removes_all_managed_ssh_rules
+t '--ssh-from removes old scoped permits'               test_ssh_from_replaces_previous_scoped_rules
+t 'no ssh permit blocks firewall policy change'         test_ssh_access_refuses_a_fresh_host_with_no_permit
+t 'a failed ssh source keeps the blanket rule'          test_ssh_access_keeps_blanket_when_a_source_fails
 t 'cidr validation rejects junk'                        test_is_cidr_rejects_junk
 
 t 'docker loopback port is recognised'                  test_docker_port_is_loopback_only

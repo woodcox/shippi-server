@@ -2605,26 +2605,67 @@ ufw_delete_rule() {
   return 1
 }
 
+# CIDRs of scoped SSH permits this script previously added.
+#
+# `ufw show added` renders the exact command used to create each rule, so the
+# comment is available without parsing the numbered/normalised status table.
+# Returns non-zero when ufw cannot be read, so callers do not mistake
+# "unknown" for "none".
+ufw_managed_ssh_sources() {
+  local port="$1" added
+  added="$(peek ufw show added 2>/dev/null)" || return 1
+  printf '%s\n' "$added" |
+    sed -nE "s/^ufw limit from (.+) to any port ${port} proto tcp comment ['\"]shippi: ssh lan['\"]$/\1/p"
+}
+
+# Delete scoped SSH permits this script previously added, except the CIDRs
+# named after the port. Called only after the replacement permits are in
+# place, so a failed replacement never removes the only working source.
+# Passing no CIDRs removes every managed scoped permit (the tailnet-only path).
+remove_stale_managed_ssh_rules() {
+  local port="$1"; shift
+  local -A keep=()
+  local cidr existing rc=0
+  for cidr in "$@"; do
+    keep["$cidr"]=1
+  done
+  if ! existing="$(ufw_managed_ssh_sources "$port")"; then
+    warn "could not read ufw's managed SSH rules; stale scoped permits may remain"
+    return 1
+  fi
+  while read -r cidr; do
+    [[ -n $cidr ]] || continue
+    [[ -n ${keep[$cidr]:-} ]] && continue
+    ufw_delete_rule limit from "$cidr" to any port "$port" proto tcp || rc=1
+  done <<<"$existing"
+  return "$rc"
+}
+
 # Install the SSH permits. The old script wrote one blanket
 # `ufw limit <port>/tcp`, which is a public permit. This writes:
 #   * one rate-limited permit per LAN prefix, so `.local` SSH from the same
 #     link keeps working over both IPv4 and IPv6;
 #   * one permit on tailscale0, so the tailnet is always a way back in.
-# Only then is the blanket rule removed. The order matters: on an already
-# active firewall, deleting the broad rule before the scoped ones exist
-# leaves a window in which a new login is refused.
+# Only after those permits are in place are stale scoped rules, the old
+# blanket rule and any previous tailnet-only deny removed.
+#
+# Failure policy: return non-zero when no usable permit exists, when any
+# requested source could not be applied, or when the blanket rule cannot be
+# removed. configure_firewall treats that as "do not change the default policy
+# or enable ufw", because a default-deny with no proven way in is a lockout.
 configure_ssh_access() {
   local ssh_port="$1"
   local -a sources=()
-  local cidr kind tailnet_ok=0 applied=0 broad_removed=1
+  local cidr kind tailnet_ok=0 applied=0 broad_removed=1 failed=0 stale_failed=0
 
   SSH_LAN_APPLIED=()
 
   if ((${#SSH_FROM[@]})); then
     for cidr in "${SSH_FROM[@]}"; do
       if ! is_cidr "$cidr"; then
-        warn "ignoring invalid --ssh-from value: ${cidr}"
-        continue
+        warn "invalid --ssh-from value: ${cidr}"
+        note "not touching the firewall; fix the CIDR and re-run"
+        return 1
       fi
       sources+=("$cidr")
     done
@@ -2633,17 +2674,6 @@ configure_ssh_access() {
       [[ -n $cidr ]] || continue
       sources+=("$cidr")
     done < <(lan_cidrs)
-  fi
-
-  # A previous Tailscale-only run wrote a blanket deny. ufw evaluates rules
-  # in order, so a deny left above the new permits would shadow all of them.
-  # Unlike the old broad allow/limit delete below, failure here is a reason to
-  # stop: adding permits that a surviving deny shadows would report success
-  # while SSH stayed closed.
-  if ! ufw_delete_rule deny "$ssh_port/tcp"; then
-    warn "could not remove the existing deny rule for ${ssh_port}/tcp; leaving SSH rules alone"
-    note "remove it manually: sudo ufw delete deny ${ssh_port}/tcp"
-    return 1
   fi
 
   # Tailnet first. This is independent of the blanket tailscale0 allow in
@@ -2662,12 +2692,6 @@ configure_ssh_access() {
     else
       warn "could not allow ssh on tailscale0"
     fi
-  fi
-
-  if ((${#sources[@]} == 0)); then
-    warn "cannot determine the LAN subnet for SSH; leaving the existing SSH rules unchanged"
-    note "pass --ssh-from <cidr> (repeatable) to restrict SSH to a known source range"
-    return 0
   fi
 
   for cidr in "${sources[@]}"; do
@@ -2690,17 +2714,43 @@ configure_ssh_access() {
       applied=1
     else
       warn "could not restrict ssh to ${cidr}"
+      failed=1
     fi
   done
 
+  # A requested source that failed is a hard failure even if another source
+  # (or the tailnet) worked: the caller asked for that range, and removing the
+  # blanket rule now would silently drop it. Keep the old rules and stop.
+  if ((failed)); then
+    warn "could not apply every requested SSH source; keeping the existing blanket rule"
+    note "SSH may still be reachable from the internet; fix the failing source and re-run"
+    return 1
+  fi
+
   if ((applied == 0)); then
-    warn "no scoped SSH rule could be applied; leaving the existing SSH rules unchanged"
+    if ((tailnet_ok == 0)); then
+      warn "no usable SSH permit: no LAN subnet could be determined and tailscale is not available"
+      note "not changing the firewall policy; pass --ssh-from <cidr> (repeatable)"
+      return 1
+    fi
+    warn "cannot determine the LAN subnet for SSH; leaving the existing SSH rules unchanged"
+    note "pass --ssh-from <cidr> (repeatable) to restrict SSH to a known source range"
+    note "the tailnet permit was added, but an existing blanket rule may still be world-reachable"
     return 0
   fi
 
-  # Only now remove the blanket permit. This is the step that actually closes
-  # the public port on a box hardened by an earlier version. If a delete
-  # fails, say so: a stale permit means SSH is still world-reachable.
+  # The replacement permits are in place. Only now remove the old
+  # tailnet-only deny, then stale scoped rules, then the blanket permit.
+  if ! ufw_delete_rule deny "$ssh_port/tcp"; then
+    warn "could not remove the existing deny rule for ${ssh_port}/tcp"
+    note "remove it manually: sudo ufw delete deny ${ssh_port}/tcp"
+    return 1
+  fi
+
+  if ! remove_stale_managed_ssh_rules "$ssh_port" "${sources[@]}"; then
+    stale_failed=1
+  fi
+
   for kind in allow limit; do
     if ! ufw_delete_rule "$kind" "$ssh_port/tcp"; then
       broad_removed=0
@@ -2711,10 +2761,18 @@ configure_ssh_access() {
   if ((tailnet_ok)); then
     scope="${scope} and tailscale0"
   fi
+  if ((stale_failed)); then
+    warn "some previous scoped SSH permits could not be removed; SSH may still be reachable from an old source"
+    note "check: sudo ufw status numbered"
+  fi
   if ((!broad_removed)); then
     warn "an old blanket SSH rule is still present; SSH remains reachable from the internet"
     note "remove it with: sudo ufw delete allow ${ssh_port}/tcp && sudo ufw delete limit ${ssh_port}/tcp"
-  elif ((DRY_RUN)); then
+  fi
+  if ((stale_failed || !broad_removed)); then
+    return 1
+  fi
+  if ((DRY_RUN)); then
     note "would limit SSH to ${scope}"
   else
     ok "ssh limited to ${scope}"
@@ -2757,7 +2815,14 @@ configure_firewall() {
   # session survives on ufw's ESTABLISHED rule, so it looks fine, and the next
   # login is refused. Adding the permits first means the deny can never be the
   # last thing standing between an arriving connection and a closed door.
-  configure_ssh_access "$ssh_port"
+  #
+  # A failed permit setup is fatal to this task: applying default-deny with no
+  # proven way in is the lockout this whole ordering exists to prevent.
+  if ! configure_ssh_access "$ssh_port"; then
+    warn "not changing firewall policy: SSH access could not be secured"
+    note "fix the SSH permit issue above, then re-run the firewall task"
+    return 1
+  fi
 
   if ((DRY_RUN)); then
     note "would set: ufw default deny incoming / allow outgoing, logging on"
@@ -2857,15 +2922,21 @@ configure_firewall() {
   if ((tailscale_allowed)) && tailscale_interface_present &&
      ((${#SSH_LAN_APPLIED[@]} > 0)) &&
      ask "close the LAN SSH rules as well (tailnet remains)?" n; then
-    local cidr
-    for cidr in "${SSH_LAN_APPLIED[@]}"; do
-      ufw_delete_rule limit from "$cidr" to any port "$ssh_port" proto tcp || true
-    done
-    # A previous run may have left a blanket permit; remove it too.
-    ufw_delete_rule allow "$ssh_port/tcp" || true
-    ufw_delete_rule limit "$ssh_port/tcp" || true
-    ok "ssh is now reachable over tailscale0 only"
-    warn "LAN logins to ${ssh_port} will be refused - make sure a tailscale session works"
+    local lan_removed=1 broad_removed=1
+    # Remove every managed scoped permit, including ones left by an earlier
+    # --ssh-from run, not just the CIDRs this run happened to apply.
+    if ! remove_stale_managed_ssh_rules "$ssh_port"; then
+      lan_removed=0
+    fi
+    ufw_delete_rule allow "$ssh_port/tcp" || broad_removed=0
+    ufw_delete_rule limit "$ssh_port/tcp" || broad_removed=0
+    if ((lan_removed && broad_removed)); then
+      ok "ssh is now reachable over tailscale0 only"
+      warn "LAN logins to ${ssh_port} will be refused - make sure a tailscale session works"
+    else
+      warn "could not remove every LAN SSH rule; SSH may still be reachable from the LAN"
+      note "check: sudo ufw status numbered"
+    fi
   fi
 
   configure_docker_ufw

@@ -209,10 +209,14 @@ Some deliberate choices worth knowing before you run it:
   rate-limits SSH from the LAN prefixes on the interface carrying the default
   route, and allows it on `tailscale0`; it removes the blanket
   `ufw allow <port>/tcp` and `ufw limit <port>/tcp` rules written by earlier
-  versions. If no LAN permit can be applied, or a blanket rule cannot be
-  deleted, the task leaves those rules in place and warns. `.local` names keep
-  working because UFW's stock `before.rules` already permits mDNS on 5353, and
-  the LAN rule covers the private IPv4 subnet and the on-link IPv6 prefixes
+  versions, and it removes scoped permits left by an earlier `--ssh-from`
+  choice. If no usable LAN or tailnet permit can be established, the firewall
+  task stops before changing the default policy; if a requested source fails,
+  it keeps the existing blanket rule and reports the task incomplete. It also
+  reports incomplete when a stale scoped or blanket rule cannot be removed.
+  `.local` names keep working because UFW's stock `before.rules` already
+  permits mDNS on 5353, and the LAN rule covers the private IPv4 subnet and the
+  on-link IPv6 prefixes
   avahi advertises. If the LAN is not the default-route interface (multi-homed,
   VLANs), pass `--ssh-from <cidr>` one or more times to replace the detected
   prefixes. Existing sessions stay up, but verify a new login from each allowed

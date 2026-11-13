@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# oma-pi security hardening
+# shippi security hardening
 #
 # Sources, all three linked from the README "Requirements" section:
 #   https://chrisapproved.com/blog/raspberry-pi-hardening.html
@@ -45,16 +45,21 @@ LOCKDOWN_SSH=0
 # Keep `AllowAgentForwarding no` in the sshd block. A workflow that genuinely
 # needs `ssh -A` into this box can opt back in with --agent-forwarding.
 AGENT_FORWARDING=0
-# Keep password SSH on. Default is key-only; a user who actually logs in with
-# an ssh password opts out of the default with --password-ssh.
+# Keep password SSH off. Default is key-only; a user who actually logs in with
+# an ssh password opts in with --password-ssh.
 PASSWORD_SSH=0
 WANT_REPORT=0
 RUN_AUDIT=1
 NO_RESTART=0
 # Test-only override so the config writers can be exercised against a
 # throwaway tree instead of the live system. Unset in normal use.
-CONF_DEST="${OMAPI_SECURITY_DESTDIR:-}"
+CONF_DEST="${SHIPPI_SECURITY_DESTDIR:-}"
 SELECTED=()
+# --ssh-from values. Repeatable. Empty means "use the detected LAN prefixes".
+SSH_FROM=()
+# LAN prefixes successfully applied by configure_ssh_access. Consumed by the
+# optional "tailnet only" prompt in configure_firewall.
+SSH_LAN_APPLIED=()
 
 # Prepended, not appended: sshd honours the FIRST value it reads, so a
 # matching directive further down sshd_config - or in an Include drop-in
@@ -64,8 +69,8 @@ SELECTED=()
 # managed block in sshd_config unmatched: the new run writes a second block
 # and never removes the first, leaving two conflicting copies of every
 # directive in the file.
-MANAGED_BEGIN="# BEGIN oma-pi hardening - do not edit between these lines"
-MANAGED_END="# END oma-pi hardening"
+MANAGED_BEGIN="# BEGIN shippi hardening - do not edit between these lines"
+MANAGED_END="# END shippi hardening"
 
 # aideinit builds a file database over the whole filesystem. On an SD card
 # that is minutes of 100% CPU, so it is opt-in rather than part of the
@@ -94,10 +99,10 @@ skip() { printf '  %s-%s %s\n' "$C_DIM" "$C_OFF" "$1"; }
 
 usage() {
   cat <<'EOF'
-oma-pi security hardening
+shippi security hardening
 
 Usage:
-  omapi-harden [options] [task ...]
+  shippi-harden [options] [task ...]
 
 Supported: Raspberry Pi OS Lite / Debian 12 (bookworm), or Ubuntu 24.04
 (noble) and newer. Ubuntu 22.10-23.10 are not supported: sshd there is
@@ -113,7 +118,8 @@ Tasks (default: all but aide):
               (ModemManager warns first: it may be a cellular uplink)
   ssh         sshd hardening: no root login, key-only by default
               (--password-ssh keeps passwords), limits
-  firewall    ufw: deny incoming by default, allow only what is listening
+  firewall    ufw: deny incoming by default, allow only what is listening;
+              SSH is limited to the LAN and tailscale0, not the whole internet
   fail2ban    ban repeat SSH/auth failures, banaction matched to ufw
   updates     unattended-upgrades for security patches, no surprise reboots
   apparmor    enable AppArmor and report complain counts
@@ -131,6 +137,10 @@ Options:
       --password-ssh    keep password login over SSH (PasswordAuthentication
                         yes; default is key-only). Needs a non-root account
                         with a usable password, and asks first if none exists.
+      --ssh-from CIDR   restrict SSH to this source prefix (repeatable).
+                        Default: the LAN subnets on the default-route
+                        interface, plus tailscale0; by default SSH is never
+                        opened to 0.0.0.0/0.
       --report       also save the audit report to ~/security-audit/
       --no-audit     skip the final report
       --no-restart   write configs but do not restart any service
@@ -138,9 +148,9 @@ Options:
   -h, --help        this text
 
 Examples:
-  omapi-harden --dry-run
-  sudo omapi-harden ssh firewall fail2ban
-  sudo omapi-harden --yes --report
+  shippi-harden --dry-run
+  sudo shippi-harden ssh firewall fail2ban
+  sudo shippi-harden --yes --report
 EOF
 }
 
@@ -228,7 +238,7 @@ ask() {
   # loops, where the loop list occupies fd 0. Gating this on `[[ -t 0 ]]` was
   # wrong twice over: it skipped gum entirely inside those loops, and it also
   # reported "no tty" on a perfectly good terminal. </dev/tty is the same
-  # pattern install.sh and bin/omapi-* already use.
+  # pattern install.sh and bin/shippi-* already use.
   if have gum && [[ -e /dev/tty ]] && [[ -r /dev/tty ]]; then
     if [[ $default == y ]]; then
       gum confirm "$question" </dev/tty
@@ -290,7 +300,7 @@ ask() {
 install_staged() {
   local body="$1" target="$2" what="$3"
   local want_mode="${4:-}" want_owner="${5:-}"
-  local stage="${target}.omapi-stage.$$"
+  local stage="${target}.shippi-stage.$$"
   local tmode owner_spec towner tgroup
 
   if [[ -n $want_mode || -n $want_owner ]]; then
@@ -580,7 +590,7 @@ replace_managed_block() {
   # Not `cp -p`: that carries the mktemp body's 0600 and the invoking user's
   # ownership onto a 0640 root:root file. A plain cp onto a NEW file also has no
   # metadata of its own, so the create branch sets it explicitly.
-  local stage="${target}.omapi-stage.$$"
+  local stage="${target}.shippi-stage.$$"
   if ! run_root cp "$body" "$stage"; then
     run_root rm -f "$stage" 2>/dev/null || true
     rm -f "$body"
@@ -913,11 +923,11 @@ install_hardening_packages() {
 # Read-only audit of sudoers for rules that make root reachable without a
 # password. Never edits the files: a broken sudoers is a box where even the
 # recovery command needs the sudo it just broke, and visudo is the only safe
-# editor. OMAPI_SUDOERS / OMAPI_SUDOERS_DIR exist so the tests can point this
+# editor. SHIPPI_SUDOERS / SHIPPI_SUDOERS_DIR exist so the tests can point this
 # at a fixture instead of the host.
 check_passwordless_sudo() {
-  local main="${OMAPI_SUDOERS:-/etc/sudoers}"
-  local dir="${OMAPI_SUDOERS_DIR:-/etc/sudoers.d}"
+  local main="${SHIPPI_SUDOERS:-/etc/sudoers}"
+  local dir="${SHIPPI_SUDOERS_DIR:-/etc/sudoers.d}"
 
   # Say "not checked" rather than "clean" when the files cannot be read.
   # /etc/sudoers is 0440 root:root, so an unprivileged run cannot see it.
@@ -987,11 +997,11 @@ check_passwordless_sudo() {
 # Console autologin bypasses everything SSH does: whoever touches the keyboard
 # gets a shell as the configured user without a password. Report, never change
 # it - a kiosk or photo frame may rely on autologin, and guessing wrong means
-# the box no longer does its job. OMAPI_GETTY_DIR / OMAPI_LIGHTDM_DIR exist so
+# the box no longer does its job. SHIPPI_GETTY_DIR / SHIPPI_LIGHTDM_DIR exist so
 # the tests can point this at fixtures.
 check_console_autologin() {
-  local system_dir="${OMAPI_GETTY_DIR:-/etc/systemd/system}"
-  local lightdm_dir="${OMAPI_LIGHTDM_DIR:-/etc/lightdm}"
+  local system_dir="${SHIPPI_GETTY_DIR:-/etc/systemd/system}"
+  local lightdm_dir="${SHIPPI_LIGHTDM_DIR:-/etc/lightdm}"
   local -a getty_files=() lightdm_files=() unreadable=()
   local d f incomplete=0
 
@@ -1229,12 +1239,12 @@ configure_password_quality() {
     return 0
   fi
 
-  local common_password="${OMAPI_COMMON_PASSWORD:-/etc/pam.d/common-password}"
+  local common_password="${SHIPPI_COMMON_PASSWORD:-/etc/pam.d/common-password}"
 
   # A drop-in, not the packaged /etc/security/pwquality.conf: package updates
   # own that file. libpwquality reads pwquality.conf.d/*.conf after it.
-  if ! write_conf /etc/security/pwquality.conf.d/omapi-hardening.conf <<'EOF'
-# Managed by oma-pi omapi-harden. Re-run the script to change these.
+  if ! write_conf /etc/security/pwquality.conf.d/shippi-hardening.conf <<'EOF'
+# Managed by shippi shippi-harden. Re-run the script to change these.
 # Enforced by pam_pwquality at passwd time, including the PAM
 # password-change prompt over SSH.
 minlen = 15
@@ -1276,7 +1286,7 @@ EOF
   else
     warn "could not enable pam_pwquality; password changes are NOT being checked"
     note "if pam-auth-update reported local changes, merge /etc/pam.d/common-password by hand"
-    note "the policy is in /etc/security/pwquality.conf.d/omapi-hardening.conf"
+    note "the policy is in /etc/security/pwquality.conf.d/shippi-hardening.conf"
   fi
 }
 
@@ -1503,7 +1513,7 @@ harden_ssh() {
     warn "no non-root account with a usable authorized_keys entry was found"
     # Default no, and deliberately not overridable by --yes/--force. Those
     # flags take *defaults*, and defaulting this one to yes means every
-    # `sudo omapi-harden --yes` run turns passwords off on a box with no
+    # `sudo shippi-harden --yes` run turns passwords off on a box with no
     # verified way back in, which is the exact failure this whole check
     # exists to prevent. Continuing requires a deliberate interactive yes.
     if ! ask "switch SSH to key-only anyway (make sure you can reach this box another way)?" n; then
@@ -1516,13 +1526,13 @@ harden_ssh() {
 
   local new_port="$port" change_port=0
   if ((LOCKDOWN_SSH)); then
-    # Under `sudo omapi-harden`, id -un is root. AllowUsers root alongside
+    # Under `sudo shippi-harden`, id -un is root. AllowUsers root alongside
     # PermitRootLogin no is a config sshd accepts and that locks out every
     # account, so the real invoking user has to be resolved, and root has to
     # be refused outright.
     local target_user="${SUDO_USER:-$(id -un)}"
     if [[ -z $target_user || $target_user == root ]]; then
-      warn "--lockdown-ssh needs a real non-root user; run it as 'sudo -u \$USER -E omapi-harden --lockdown-ssh' or from a root shell with SUDO_USER set"
+      warn "--lockdown-ssh needs a real non-root user; run it as 'sudo -u \$USER -E shippi-harden --lockdown-ssh' or from a root shell with SUDO_USER set"
       warn "refusing to write AllowUsers root: it would lock out every account"
       LOCKDOWN_SSH=0
     elif ! have_usable_key "$(key_files_for_user "$target_user")"; then
@@ -1645,7 +1655,7 @@ harden_ssh() {
     cat <<EOF
 # Prepended because sshd takes the first value it reads, so the same
 # directive further down the file (or in an Include drop-in above this)
-# would silently override it. Re-run omapi-harden to change these; edits
+# would silently override it. Re-run shippi-harden to change these; edits
 # inside the block are lost on the next run.
 PermitRootLogin no
 PubkeyAuthentication yes
@@ -1696,7 +1706,7 @@ EOF
   # block, because the rollback is outside it and would otherwise see nothing.
   local dropin_backups=""
   if ((!DRY_RUN)) && [[ -f $target ]]; then
-    backup="${target}.omapi-backup"
+    backup="${target}.shippi-backup"
     if ! run_root cp -p "$target" "$backup"; then
       warn "could not back up ${conf}; leaving it untouched"
       rm -f "$block"
@@ -1796,7 +1806,7 @@ EOF
       # drop-ins modified - a config inconsistency that would only bite on the
       # next sshd start, which is exactly the kind of thing that surfaces hours
       # later as "ssh won't come back".
-      local dbak="${dropin}.omapi-backup"
+      local dbak="${dropin}.shippi-backup"
       # Do not rewrite a file we could not back up. The sshd -t rollback
       # restores from these backups, so rewriting without one leaves an
       # unrestorable change on a file sshd reads.
@@ -1814,7 +1824,7 @@ EOF
           next
         }
         { print }
-      ' "$dropin" >"$rewrite" && run_root cp "$rewrite" "$dropin.omapi-tmp"; then
+      ' "$dropin" >"$rewrite" && run_root cp "$rewrite" "$dropin.shippi-tmp"; then
         # Same reasoning as the main file: rename rather than truncate-and-copy,
         # so a failed write cannot leave a half-written drop-in for sshd to read
         # on the next start.
@@ -1835,27 +1845,27 @@ EOF
           if [[ -z $dmode ]]; then
             # Do not guess a mode. Renaming without knowing it could widen a
             # root-owned drop-in, which is worse than leaving it alone.
-            run_root rm -f "$dropin.omapi-tmp"
+            run_root rm -f "$dropin.shippi-tmp"
             warn "could not read the mode of ${dropin}; leaving it untouched"
-          elif ! run_root chmod "$dmode" "$dropin.omapi-tmp" 2>/dev/null ||
-               ! run_root chown --reference="$dropin" "$dropin.omapi-tmp" 2>/dev/null; then
-            run_root rm -f "$dropin.omapi-tmp"
+          elif ! run_root chmod "$dmode" "$dropin.shippi-tmp" 2>/dev/null ||
+               ! run_root chown --reference="$dropin" "$dropin.shippi-tmp" 2>/dev/null; then
+            run_root rm -f "$dropin.shippi-tmp"
             warn "could not set the mode/owner on the staged drop-in; leaving it untouched"
-          elif run_root mv -f "$dropin.omapi-tmp" "$dropin"; then
+          elif run_root mv -f "$dropin.shippi-tmp" "$dropin"; then
             :
           else
-            run_root rm -f "$dropin.omapi-tmp"
+            run_root rm -f "$dropin.shippi-tmp"
             warn "could not install ${dropin}; it has NOT been changed"
           fi
         else
-          run_root rm -f "$dropin.omapi-tmp"
+          run_root rm -f "$dropin.shippi-tmp"
           warn "refusing to install an empty drop-in; leaving it untouched"
         fi
       else
         # Never rewrite a file we cannot read back correctly: a half-written
         # drop-in is a box that may not come back.
         warn "could not rewrite Port lines in ${dropin}; leaving it untouched"
-        run_root rm -f "$dropin.omapi-tmp"
+        run_root rm -f "$dropin.shippi-tmp"
       fi
     done
     rm -f "$rewrite"
@@ -1886,7 +1896,7 @@ EOF
     local dbak
     while read -r dbak; do
       [[ -n $dbak && -f $dbak ]] || continue
-      run_root cp -p "$dbak" "${dbak%.omapi-backup}" || warn "could not restore ${dbak%.omapi-backup}"
+      run_root cp -p "$dbak" "${dbak%.shippi-backup}" || warn "could not restore ${dbak%.shippi-backup}"
     done <<<"${dropin_backups:-}"
     if [[ -n $backup ]]; then
       warn "sshd rejected the new config, rolling ${conf} back"
@@ -2317,7 +2327,7 @@ install_docker_ufw_rules() {
   {
     printf '%s\n' "$DOCKER_UFW_BEGIN"
     cat <<'EOF'
-# Managed by omapi-harden. Rules from chaifeng/ufw-docker.
+# Managed by shippi-harden. Rules from chaifeng/ufw-docker.
 #
 # Without these, Docker's own DNAT/ACCEPT rules sit ahead of ufw's and a
 # published port is reachable from the internet regardless of ufw.
@@ -2414,7 +2424,7 @@ install_docker_ufw6_rules() {
   {
     printf '%s\n' "$DOCKER_UFW_BEGIN"
     cat <<'EOF'
-# Managed by omapi-harden. IPv6 twin of the after.rules block.
+# Managed by shippi-harden. IPv6 twin of the after.rules block.
 *filter
 :ufw6-user-forward - [0:0]
 :ufw6-docker-logging-deny - [0:0]
@@ -2469,6 +2479,367 @@ docker_published_by() {
     }'
 }
 
+# ---------------------------------------------------------------------------
+# SSH exposure
+# ---------------------------------------------------------------------------
+# The interface carrying the default route is the LAN side. Its connected
+# prefixes are what a `.local` client can legitimately come from: avahi
+# advertises the IPv4 subnet and the IPv6 prefixes on that same interface, so
+# limiting SSH to them keeps mDNS-name logins working without opening the
+# port to the world.
+#
+# Deliberately never falls back to 0.0.0.0/0. If this cannot work out the
+# LAN, configure_ssh_access leaves the existing SSH rules alone and says to
+# pass --ssh-from. "Cannot detect" must not become "open to everyone", and it
+# must not become "nobody" either.
+lan_cidrs() {
+  local -a ifaces=()
+  local iface
+  while read -r iface; do
+    [[ -n $iface ]] || continue
+    case $iface in
+      lo | tailscale* | docker* | br-* | veth*) continue ;;
+    esac
+    ifaces+=("$iface")
+  done < <(
+    {
+      ip -4 route show default 2>/dev/null
+      ip -6 route show default 2>/dev/null
+    } | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); next }}' | sort -u
+  )
+
+  # No default route: an isolated LAN still has on-link prefixes, and SSH
+  # should not stay world-reachable just because there is no gateway.
+  if ((${#ifaces[@]} == 0)); then
+    while read -r iface; do
+      [[ -n $iface ]] || continue
+      case $iface in
+        lo | tailscale* | docker* | br-* | veth*) continue ;;
+      esac
+      ifaces+=("$iface")
+    done < <(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1)
+  fi
+
+  local v4 has_private p
+  for iface in "${ifaces[@]}"; do
+    v4="$(ip -4 route show dev "$iface" 2>/dev/null |
+      awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ && $0 !~ / via / {print $1}')"
+    has_private=0
+    while read -r p; do
+      [[ -n $p ]] || continue
+      case $p in
+        10.[0-9]* | 192.168.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].*) has_private=1 ;;
+      esac
+    done <<<"$v4"
+
+    # A public IPv4 prefix is a WAN address, not a LAN. Do not turn the
+    # default route into a public permit on a VPS. Skipping the whole
+    # interface also keeps its public IPv6 /64 out; an IPv6-only or
+    # public-IPv4 LAN can still be described with --ssh-from.
+    if ((!has_private)); then
+      continue
+    fi
+
+    # On-link IPv4 prefix, not the whole RFC1918 space: this box may sit on a
+    # 10.x network whose other subnets are not local. A `via` route is some
+    # other network reachable through a router, not this link.
+    printf '%s\n' "$v4" |
+      awk '$1 ~ /^10\./ || $1 ~ /^192\.168\./ ||
+           $1 ~ /^172\.(1[6-9]|2[0-9]|3[01])\./ {print $1}'
+    # On-link IPv6 prefixes. This is what avahi advertises for the interface:
+    # the public SLAAC /64 and fe80::/64, not a delegated prefix routed in from
+    # somewhere else. fe80::/64 is included because a client can reach the
+    # Pi's link-local address, and excluding it would make a working `.local`
+    # login fail. Multicast routes are never a source.
+    ip -6 route show dev "$iface" 2>/dev/null |
+      awk '$1 ~ /^[0-9A-Fa-f:]+\/[0-9]+$/ && $1 !~ /^ff00::\/8$/ && $0 !~ / via / {print $1}'
+  done | sort -u
+}
+
+tailscale_interface_present() {
+  [[ -d /sys/class/net/tailscale0 ]] || (peek tailscale status &>/dev/null)
+}
+
+ufw_ipv6_enabled() {
+  grep -qE '^IPV6=yes' "${CONF_DEST}/etc/default/ufw" 2>/dev/null
+}
+
+# A source prefix the caller asked for. Shape check only; ufw is the final
+# validator, but a typo should not reach it as an empty or flag-like argument.
+is_cidr() {
+  local cidr="$1" addr prefix o
+  local -a octets
+  [[ $cidr == */* ]] || return 1
+  addr="${cidr%/*}"
+  prefix="${cidr##*/}"
+  [[ $prefix =~ ^[0-9]{1,3}$ ]] || return 1
+  if [[ $addr == *:* ]]; then
+    ((prefix <= 128)) || return 1
+    [[ $addr =~ ^[0-9A-Fa-f:]+$ ]]
+    return
+  fi
+  ((prefix <= 32)) || return 1
+  [[ $addr =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -r -a octets <<<"$addr"
+  for o in "${octets[@]}"; do
+    ((10#$o >= 0 && 10#$o <= 255)) || return 1
+  done
+}
+
+# Return the source form UFW actually stores.
+#
+# UFW normalizes a source before writing the rule: IPv4 is reduced to its
+# network address, and /32 or IPv6 /128 is dropped. Comparing the operator's
+# typed value with `ufw show added` would classify the just-added rule as
+# stale and delete it. Use UFW's own normalizer so both sides match; fall back
+# to the typed value when the module is unavailable (for example, a dry run on
+# a host where ufw is not installed).
+ufw_normalize_cidr() {
+  local cidr="$1" normalized
+  normalized="$(python3 - "$cidr" <<'PY'
+import sys
+from ufw.util import normalize_address
+
+cidr = sys.argv[1]
+try:
+    print(normalize_address(cidr, ":" in cidr)[0])
+except Exception:
+    print(cidr)
+PY
+)" || normalized="$cidr"
+  printf '%s\n' "${normalized:-$cidr}"
+}
+
+# Delete a ufw rule, treating "non-existent rule" as success. A genuine
+# failure matters on the SSH path: a blanket permit that survives the run
+# keeps SSH reachable from the internet while the script claims otherwise.
+ufw_delete_rule() {
+  if ((DRY_RUN)); then
+    printf '  %s•%s would run: ufw delete %s\n' "$C_DIM" "$C_OFF" "$*"
+    return 0
+  fi
+  local out
+  if out="$(run_root ufw delete "$@" 2>&1)"; then
+    return 0
+  fi
+  if [[ $out == *"non-existent rule"* ]]; then
+    return 0
+  fi
+  warn "could not delete ufw rule '$*': ${out:-command failed}"
+  return 1
+}
+
+# Delete every form of blanket SSH permit this script knows about.
+#
+# UFW matches deletion against the original rule specification, and a rule
+# written without a protocol (`ufw allow 22`) permits both TCP and UDP.
+# Deleting only `22/tcp` leaves that broader rule in place, so match both.
+remove_blanket_ssh_rules() {
+  local port="$1" kind spec rc=0
+  for kind in allow limit; do
+    for spec in "$port/tcp" "$port"; do
+      ufw_delete_rule "$kind" "$spec" || rc=1
+    done
+  done
+  return "$rc"
+}
+
+# CIDRs of scoped SSH permits this script previously added.
+#
+# `ufw show added` renders the exact command used to create each rule, so the
+# comment is available without parsing the numbered/normalised status table.
+# Returns non-zero when ufw cannot be read, so callers do not mistake
+# "unknown" for "none".
+ufw_managed_ssh_sources() {
+  local port="$1" added
+  added="$(peek ufw show added 2>/dev/null)" || return 1
+  printf '%s\n' "$added" |
+    sed -nE "s/^ufw limit from (.+) to any port ${port} proto tcp comment ['\"]shippi: ssh lan['\"]$/\1/p"
+}
+
+# Delete scoped SSH permits this script previously added, except the CIDRs
+# named after the port. Called only after the replacement permits are in
+# place, so a failed replacement never removes the only working source.
+# Passing no CIDRs removes every managed scoped permit (the tailnet-only path).
+remove_stale_managed_ssh_rules() {
+  local port="$1"; shift
+  local -A keep=()
+  local cidr existing rc=0
+  for cidr in "$@"; do
+    keep["$cidr"]=1
+  done
+  if ! existing="$(ufw_managed_ssh_sources "$port")"; then
+    if ((DRY_RUN)); then
+      note "cannot read current ufw rules in dry-run; stale scoped permits are unknown"
+      return 0
+    fi
+    warn "could not read ufw's managed SSH rules; stale scoped permits may remain"
+    return 1
+  fi
+  while read -r cidr; do
+    [[ -n $cidr ]] || continue
+    [[ -n ${keep[$cidr]:-} ]] && continue
+    ufw_delete_rule limit from "$cidr" to any port "$port" proto tcp || rc=1
+  done <<<"$existing"
+  return "$rc"
+}
+
+# Install the SSH permits. The old script wrote one blanket
+# `ufw limit <port>/tcp`, which is a public permit. This writes:
+#   * one rate-limited permit per LAN prefix, so `.local` SSH from the same
+#     link keeps working over both IPv4 and IPv6;
+#   * one permit on tailscale0, so the tailnet is always a way back in.
+# Only after those permits are in place are stale scoped rules, the old
+# blanket rule and any previous tailnet-only deny removed.
+#
+# Failure policy: return non-zero when no usable permit exists, when any
+# requested source could not be applied, or when the blanket rule cannot be
+# removed. configure_firewall treats that as "do not change the default policy
+# or enable ufw", because a default-deny with no proven way in is a lockout.
+configure_ssh_access() {
+  local ssh_port="$1"
+  local -a sources=()
+  local cidr kind normalized tailnet_ok=0 applied=0 broad_removed=1 failed=0 stale_failed=0 tailnet_only=0
+
+  SSH_LAN_APPLIED=()
+
+  if ((${#SSH_FROM[@]})); then
+    for cidr in "${SSH_FROM[@]}"; do
+      if ! is_cidr "$cidr"; then
+        warn "invalid --ssh-from value: ${cidr}"
+        note "not touching the firewall; fix the CIDR and re-run"
+        return 1
+      fi
+      normalized="$(ufw_normalize_cidr "$cidr")"
+      if [[ $normalized == */0 ]]; then
+        warn "--ssh-from ${cidr} would allow every address"
+        note "use a narrower source prefix; not touching the firewall"
+        return 1
+      fi
+      sources+=("$normalized")
+    done
+  else
+    while read -r cidr; do
+      [[ -n $cidr ]] || continue
+      sources+=("$cidr")
+    done < <(lan_cidrs)
+  fi
+
+  # Tailnet first. This is independent of the blanket tailscale0 allow in
+  # configure_firewall: even if the caller declines that, SSH itself should
+  # stay reachable over the tailnet, which is the least likely path to be the
+  # current session.
+  if tailscale_interface_present; then
+    if ((DRY_RUN)); then
+      printf '  %s•%s would allow: ufw limit in on tailscale0 to any port %s proto tcp\n' \
+        "$C_DIM" "$C_OFF" "$ssh_port"
+      tailnet_ok=1
+    elif run_root ufw limit in on tailscale0 to any port "$ssh_port" proto tcp \
+      comment "shippi: ssh tailnet"; then
+      tailnet_ok=1
+      ok "ssh reachable over tailscale0"
+    else
+      warn "could not allow ssh on tailscale0"
+    fi
+  fi
+
+  for cidr in "${sources[@]}"; do
+    # ufw refuses IPv6 rules when its own IPv6 support is off. Skipping them
+    # here is better than aborting the whole firewall task on a v4-only box.
+    if [[ $cidr == *:* ]] && ! ufw_ipv6_enabled; then
+      note "skipping IPv6 SSH source ${cidr}: ufw has IPv6 disabled"
+      continue
+    fi
+    if ((DRY_RUN)); then
+      printf '  %s•%s would allow: ufw limit from %s to any port %s proto tcp\n' \
+        "$C_DIM" "$C_OFF" "$cidr" "$ssh_port"
+      SSH_LAN_APPLIED+=("$cidr")
+      applied=1
+      continue
+    fi
+    if run_root ufw limit from "$cidr" to any port "$ssh_port" proto tcp \
+      comment "shippi: ssh lan"; then
+      SSH_LAN_APPLIED+=("$cidr")
+      applied=1
+    else
+      warn "could not restrict ssh to ${cidr}"
+      failed=1
+    fi
+  done
+
+  # A requested source that failed is a hard failure even if another source
+  # (or the tailnet) worked: the caller asked for that range, and removing the
+  # blanket rule now would silently drop it. Keep the old rules and stop.
+  if ((failed)); then
+    warn "could not apply every requested SSH source; keeping the existing blanket rule"
+    note "SSH may still be reachable from the internet; fix the failing source and re-run"
+    return 1
+  fi
+
+  if ((applied == 0)); then
+    if ((tailnet_ok == 0)); then
+      warn "no usable SSH permit: no LAN subnet could be determined and tailscale is not available"
+      note "not changing the firewall policy; pass --ssh-from <cidr> (repeatable)"
+      return 1
+    fi
+    # Only the tailnet permit is available. Close the blanket rule anyway: the
+    # operator asked for exposure removal, and the tailnet is the way in. This
+    # can refuse new LAN logins, so say so and verify the tailnet path.
+    tailnet_only=1
+    warn "no LAN SSH permit could be applied; closing the blanket rule"
+    note "pass --ssh-from <cidr> (repeatable) if LAN logins must keep working"
+  fi
+
+  # The replacement permits are in place. Only now remove the old
+  # tailnet-only deny, then stale scoped rules, then the blanket permit.
+  if ! ufw_delete_rule deny "$ssh_port/tcp"; then
+    warn "could not remove the existing deny rule for ${ssh_port}/tcp"
+    note "remove it manually: sudo ufw delete deny ${ssh_port}/tcp"
+    return 1
+  fi
+
+  if ! remove_stale_managed_ssh_rules "$ssh_port" "${sources[@]}"; then
+    stale_failed=1
+  fi
+
+  if ! remove_blanket_ssh_rules "$ssh_port"; then
+    broad_removed=0
+  fi
+
+  local scope=""
+  if ((${#SSH_LAN_APPLIED[@]})); then
+    scope="${SSH_LAN_APPLIED[*]}"
+  fi
+  if ((tailnet_ok)); then
+    if [[ -n $scope ]]; then
+      scope="${scope} and tailscale0"
+    else
+      scope="tailscale0"
+    fi
+  fi
+  if ((stale_failed)); then
+    warn "some previous scoped SSH permits could not be removed; SSH may still be reachable from an old source"
+    note "check: sudo ufw status numbered"
+  fi
+  if ((!broad_removed)); then
+    warn "an old blanket SSH rule is still present; SSH remains reachable from the internet"
+    note "remove it with: sudo ufw delete allow ${ssh_port}/tcp && sudo ufw delete limit ${ssh_port}/tcp"
+  fi
+  if ((stale_failed || !broad_removed)); then
+    return 1
+  fi
+  if ((DRY_RUN)); then
+    note "would limit SSH to ${scope}"
+  else
+    ok "ssh limited to ${scope}"
+    if ((tailnet_only)); then
+      warn "LAN logins to ${ssh_port} will be refused - verify a tailscale session now"
+    else
+      note "existing sessions stay up; verify a new login from each allowed source before closing this one"
+    fi
+  fi
+}
+
 configure_firewall() {
   section "Firewall (ufw)"
 
@@ -2481,12 +2852,12 @@ configure_firewall() {
   # returns before the first `ufw` command runs. This guard used to sit after
   # `ufw default deny incoming`, so on a box where ufw was already active the
   # script flipped the incoming policy to deny and then bailed out - never
-  # adding the `ufw limit` rule for the SSH port. If that box relied on the
-  # broad allow policy, every new SSH connection was blocked while the script
-  # reported "not touching the firewall".
+  # adding the permits for the SSH port. If that box relied on the broad allow
+  # policy, every new SSH connection was blocked while the script reported
+  # "not touching the firewall".
   local ssh_port
   ssh_port="$(current_ssh_port || true)"
-  # Stop rather than guess. A `ufw limit /tcp` with an empty port is silently
+  # Stop rather than guess. An SSH rule with an empty port is silently
   # malformed, and carrying on to default-deny would close the port the user is
   # connected on. This is the one place in the script where not knowing the
   # answer must mean doing nothing.
@@ -2498,17 +2869,19 @@ configure_firewall() {
   fi
 
   # Allow BEFORE deny, not after. ufw evaluates rules in order, and a
-  # `default deny` that lands before the SSH rule leaves a window in which
+  # `default deny` that lands before the SSH permits leaves a window in which
   # new inbound connections are denied with nothing to permit them. On a box
   # where ufw is ALREADY active that is a real reconnect lockout: the current
   # session survives on ufw's ESTABLISHED rule, so it looks fine, and the next
-  # login is refused. Adding the permit first means the deny can never be the
+  # login is refused. Adding the permits first means the deny can never be the
   # last thing standing between an arriving connection and a closed door.
-  if ((DRY_RUN)); then
-    printf '  %s•%s would allow: ufw limit %s/tcp\n' "$C_DIM" "$C_OFF" "$ssh_port"
-  else
-    run_root ufw limit "$ssh_port/tcp"
-    ok "ssh rate-limited on port ${ssh_port}"
+  #
+  # A failed permit setup is fatal to this task: applying default-deny with no
+  # proven way in is the lockout this whole ordering exists to prevent.
+  if ! configure_ssh_access "$ssh_port"; then
+    warn "not changing firewall policy: SSH access could not be secured"
+    note "fix the SSH permit issue above, then re-run the firewall task"
+    return 1
   fi
 
   if ((DRY_RUN)); then
@@ -2523,11 +2896,11 @@ configure_firewall() {
   # Tailscale's interface is not a public interface, but ufw still counts
   # packets arriving on it, and losing the tailnet would lose the way back in.
   local tailscale_allowed=0
-  if [[ -d /sys/class/net/tailscale0 ]] || (peek tailscale status &>/dev/null); then
+  if tailscale_interface_present; then
     if ((DRY_RUN)); then
       printf '  %s•%s would allow: ufw allow in on tailscale0\n' "$C_DIM" "$C_OFF"
     elif ask "allow traffic arriving on the tailscale0 interface?" y; then
-      run_root ufw allow in on tailscale0 comment "omapi: tailscale"
+      run_root ufw allow in on tailscale0 comment "shippi: tailscale"
       tailscale_allowed=1
       ok "tailscale0 allowed"
     else
@@ -2574,11 +2947,25 @@ configure_firewall() {
       if ((DRY_RUN)); then
         printf '  %s•%s would allow: ufw allow %s/%s\n' "$C_DIM" "$C_OFF" "$port" "$proto"
       else
-        run_root ufw allow "$port/$proto" comment "omapi: $(listening_process "$proto" "$port" || true)"
+        run_root ufw allow "$port/$proto" comment "shippi: $(listening_process "$proto" "$port" || true)"
         ok "allowed ${proto}/${port}"
       fi
     else
-      skip "left ${proto}/${port} closed"
+      # "No" must close a port an earlier run opened, not merely decline to
+      # add another rule. Without this delete the old allow rule survived and
+      # the output still said "left ... closed".
+      if ((DRY_RUN)); then
+        printf '  %s•%s would close: ufw delete allow %s/%s\n' "$C_DIM" "$C_OFF" "$port" "$proto"
+      else
+        local out
+        if out="$(run_root ufw delete allow "$port/$proto" 2>&1)"; then
+          ok "closed ${proto}/${port}"
+        elif [[ $out == *"non-existent rule"* ]]; then
+          skip "left ${proto}/${port} closed"
+        else
+          warn "could not close ${proto}/${port}: ${out:-command failed}"
+        fi
+      fi
     fi
   done 3< <(listening_ports)
 
@@ -2588,28 +2975,26 @@ configure_firewall() {
     note "published port. Fixing that now with the DOCKER-USER chain."
   fi
 
-  # If the tailnet is the only way in, port 22 can go away entirely. This is
-  # the network-level half of the VPN advice in the guides, and it is the one
-  # step that can end a session, so it is opt-in and loud.
-  # Gated on the tailnet actually being allowed. Declining the interface prompt
-  # above leaves tailnet traffic under `default deny incoming`, so allowing a
-  # "Tailscale SSH only" close here would delete the SSH rule and add a deny
-  # while leaving no route back in at all - the next login is refused on the
-  # WAN and on the tailnet. Refuse rather than offer it.
-  if ((tailscale_allowed)) && [[ -d /sys/class/net/tailscale0 ]] &&
-     ask "close port ${ssh_port} completely (Tailscale SSH only)?" n; then
-    if ((DRY_RUN)); then
-      printf '  %s•%s would deny: ufw deny %s/tcp\n' "$C_DIM" "$C_OFF" "$ssh_port"
+  # The scoped permits above already keep SSH off the public internet. This
+  # optional step removes the LAN permits too, leaving only tailscale0. It is
+  # gated on the blanket tailnet allow: declining that leaves tailnet traffic
+  # under default deny, so a "tailnet only" close would delete the last way in.
+  if ((tailscale_allowed)) && tailscale_interface_present &&
+     ((${#SSH_LAN_APPLIED[@]} > 0)) &&
+     ask "close the LAN SSH rules as well (tailnet remains)?" n; then
+    local lan_removed=1 broad_removed=1
+    # Remove every managed scoped permit, including ones left by an earlier
+    # --ssh-from run, not just the CIDRs this run happened to apply.
+    if ! remove_stale_managed_ssh_rules "$ssh_port"; then
+      lan_removed=0
+    fi
+    remove_blanket_ssh_rules "$ssh_port" || broad_removed=0
+    if ((lan_removed && broad_removed)); then
+      ok "ssh is now reachable over tailscale0 only"
+      warn "LAN logins to ${ssh_port} will be refused - make sure a tailscale session works"
     else
-      # `delete limit`, not `delete allow`: the rule added above is a
-      # `ufw limit` one, so `delete allow` matches nothing and leaves it in
-      # place. The `|| true` hid that, and a stale limit rule reappears the
-      # moment the deny is ever removed. Delete both forms so a box that
-      # predates this script is handled too.
-      run_root ufw delete limit "$ssh_port/tcp" || true
-      run_root ufw delete allow "$ssh_port/tcp" || true
-      run_root ufw deny "$ssh_port/tcp" comment "omapi: ssh over tailscale only"
-      warn "port ${ssh_port} is now denied - make sure a tailscale session works"
+      warn "could not remove every LAN SSH rule; SSH may still be reachable from the LAN"
+      note "check: sudo ufw status numbered"
     fi
   fi
 
@@ -2703,7 +3088,7 @@ docker_offer_published_ports() {
         # kept set -e off the failure but not the report, so a rejected rule
         # printed a warning AND a success line, and the user trusted the second.
         if run_root ufw route allow proto "$proto" from any to any port "$cport" \
-             comment "omapi: ${name}"; then
+             comment "shippi: ${name}"; then
           ok "${name}: container port ${cport}/${proto} reachable from the network"
         else
           warn "could not add a route rule for ${name}:${cport}/${proto} - it is NOT reachable"
@@ -2790,7 +3175,7 @@ configure_docker_ufw() {
   }
 
   # Checked through CONF_DEST so this works against a temporary tree, and so
-  # OMAPI_SECURITY_DESTDIR cannot make the script inspect the real /etc.
+  # SHIPPI_SECURITY_DESTDIR cannot make the script inspect the real /etc.
   if docker_ufw_installed; then
     ok "DOCKER-USER rules already present in ${CONF_DEST}/etc/ufw/after.rules"
     # The v6 half is installed separately and independently. Skipping it just
@@ -2811,9 +3196,9 @@ configure_docker_ufw() {
     # Three outcomes, not two: verified, malformed, and - when not running as
     # root - unverified, because iptables-restore needs privilege even for
     # --test. Only a malformed fragment blocks the reload. An unverified one
-    # is the normal case for `omapi-harden` run as a normal user, and refusing
+    # is the normal case for `shippi-harden` run as a normal user, and refusing
     # to configure Docker at all there would be worse than proceeding with a
-    # loud warning; a real run of this script is `sudo omapi-harden`.
+    # loud warning; a real run of this script is `sudo shippi-harden`.
     local vrc=0 rrc=0
     validate_docker_ufw_rules "${CONF_DEST}/etc/ufw/after.rules" || vrc=$?
     case $vrc in
@@ -2918,7 +3303,7 @@ configure_fail2ban() {
     banaction="ufw"
   fi
 
-  local jail="/etc/fail2ban/jail.d/omapi-hardening.local"
+  local jail="/etc/fail2ban/jail.d/shippi-hardening.local"
   # Snapshot the real file BEFORE write_conf truncates it, so a rejected jail
   # can be rolled back. Claiming "leaving the previous config in place" while
   # the overwrite has already happened is how a broken file ends up breaking
@@ -2930,7 +3315,7 @@ configure_fail2ban() {
   fi
 
   write_conf "$jail" <<EOF
-# Managed by omapi-harden. Re-run the script to change these.
+# Managed by shippi-harden. Re-run the script to change these.
 [DEFAULT]
 usedns = no
 banaction = ${banaction}
@@ -3173,7 +3558,7 @@ configure_updates() {
     # `|| rpi_combo=""` matters: without root, and with stdin not a tty, peek
     # cannot run, the inner substitution returns non-zero, and under set -e
     # this line aborts the whole task. Reproduced as
-    # `omapi-harden --dry-run updates` exiting 1 on the section header.
+    # `shippi-harden --dry-run updates` exiting 1 on the section header.
     rpi_combo="$(apt_release_origin_combo "$(apt_release_line_for archive.raspberrypi.com)" || true)" || rpi_combo=""
     if [[ -n $rpi_combo ]]; then
       origins+=("\"${rpi_combo}\"")
@@ -3200,15 +3585,15 @@ configure_updates() {
   # hardening script, because it is silent. So: the Periodic keys go here, and
   # the policy goes in the script's own file.
   write_conf /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
-// Managed by omapi-harden. Re-run the script to change these.
+// Managed by shippi-harden. Re-run the script to change these.
 // These two keys are what actually enable unattended-upgrades. Without them
 // apt.systemd.daily defaults to 0 and no security patch is ever applied.
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
 
-  write_conf /etc/apt/apt.conf.d/51omapi-origins <<EOF
-// Managed by omapi-harden. Re-run the script to change these.
+  write_conf /etc/apt/apt.conf.d/51shippi-origins <<EOF
+// Managed by shippi-harden. Re-run the script to change these.
 Unattended-Upgrade::Allowed-Origins {
 ${origin_block}};
 
@@ -3222,8 +3607,8 @@ Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Acquire::Retries "3";
 EOF
 
-  write_conf /etc/apt/apt.conf.d/52omapi-unattended-upgrades <<'EOF'
-// Managed by omapi-harden. Re-run the script to change these.
+  write_conf /etc/apt/apt.conf.d/52shippi-unattended-upgrades <<'EOF'
+// Managed by shippi-harden. Re-run the script to change these.
 // No Automatic-Reboot: this box runs containers and serves a tailnet, and an
 // unattended reboot in the middle of a task is a worse outcome than a patch
 // that waits for the next maintenance window. Set it to "true" here if the
@@ -3333,8 +3718,8 @@ configure_sysctl() {
     docker_note=$'\nnet.ipv4.ip_forward = 0'
   fi
 
-  write_conf /etc/sysctl.d/99-omapi-hardening.conf <<EOF
-# Managed by oma-pi omapi-harden. Re-run the script to change these.
+  write_conf /etc/sysctl.d/99-shippi-hardening.conf <<EOF
+# Managed by shippi-harden. Re-run the script to change these.
 # Network redirects and source routes are off: a Pi is normally a plain
 # endpoint on one LAN, and none of these have a use here.
 net.ipv4.conf.all.send_redirects = 0
@@ -3375,8 +3760,8 @@ EOF
 
   # An SD card fills up, and then the box stops logging, stops patching and
   # starts failing in ways that look like hardware faults.
-  write_conf /etc/systemd/journald.conf.d/omapi-hardening.conf <<'EOF'
-# Managed by oma-pi omapi-harden. Re-run the script to change these.
+  write_conf /etc/systemd/journald.conf.d/shippi-hardening.conf <<'EOF'
+# Managed by shippi-harden. Re-run the script to change these.
 [Journal]
 SystemMaxUse=200M
 RuntimeMaxUse=50M
@@ -3438,7 +3823,7 @@ configure_aide() {
   if [[ ! -e /etc/cron.daily/aide-check ]]; then
     write_conf /etc/cron.daily/aide-check <<'EOF'
 #!/bin/sh
-# Managed by omapi-harden.
+# Managed by shippi-harden.
 # A non-zero exit is expected on any change, so cron mails the diff.
 exec /usr/bin/aide.wrapper --stdout
 EOF
@@ -3463,8 +3848,8 @@ failed_systemd_units() {
 }
 
 pending_reboot_summary() {
-  local marker="${OMAPI_REBOOT_REQUIRED:-/var/run/reboot-required}"
-  local pkgs="${OMAPI_REBOOT_PKGS:-/var/run/reboot-required.pkgs}"
+  local marker="${SHIPPI_REBOOT_REQUIRED:-/var/run/reboot-required}"
+  local pkgs="${SHIPPI_REBOOT_PKGS:-/var/run/reboot-required.pkgs}"
   local list=""
   [[ -e $marker ]] || { printf 'no'; return 0; }
   if [[ -r $pkgs ]]; then
@@ -3508,7 +3893,7 @@ kernel_flavor() {
 # permanent false "reboot to switch".
 newest_installed_kernel() {
   local rel="${1:-$(uname -r)}"
-  local boot="${OMAPI_BOOT_DIR:-/boot}"
+  local boot="${SHIPPI_BOOT_DIR:-/boot}"
   [[ -d $boot ]] || return 1
 
   local flavor
@@ -3596,7 +3981,7 @@ audit() {
   fi
 
   {
-    printf 'oma-pi security audit - %s\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
+    printf 'shippi security audit - %s\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
     printf 'host: %s   os: %s\n' "$(hostname)" "$pretty"
 
     printf '\n-- listening ports --\n'
@@ -3677,7 +4062,7 @@ audit() {
     peek aa-status 2>/dev/null | head -6 | sed 's/^/  /' || printf '  not installed\n'
 
     printf '\n-- sysctl --\n'
-    printf '  file: %s\n' "$([[ -f ${CONF_DEST}/etc/sysctl.d/99-omapi-hardening.conf ]] &&
+    printf '  file: %s\n' "$([[ -f ${CONF_DEST}/etc/sysctl.d/99-shippi-hardening.conf ]] &&
       echo present || echo absent)"
     peek sysctl net.ipv4.conf.all.rp_filter net.ipv4.tcp_syncookies 2>/dev/null |
       sed 's/^/  /' || true
@@ -3790,6 +4175,15 @@ main() {
       --lockdown-ssh) LOCKDOWN_SSH=1 ;;
       --agent-forwarding) AGENT_FORWARDING=1 ;;
       --password-ssh) PASSWORD_SSH=1 ;;
+      --ssh-from)
+        if (($# < 2)) || [[ -z ${2:-} || ${2:0:1} == - ]]; then
+          printf 'error: --ssh-from needs a CIDR\n\n' >&2
+          usage >&2
+          return 2
+        fi
+        SSH_FROM+=("$2")
+        shift
+        ;;
       --report) WANT_REPORT=1 ;;
       --no-audit) RUN_AUDIT=0 ;;
       --no-restart) NO_RESTART=1 ;;
@@ -3815,7 +4209,7 @@ main() {
     fi
   done
 
-  printf '%s   oma-pi  security hardening%s\n' "$C_RED" "$C_OFF"
+  printf '%s   shippi  security hardening%s\n' "$C_RED" "$C_OFF"
   if ((DRY_RUN)); then
     printf '%s   dry run: nothing is changed, no service is restarted%s\n' "$C_DIM" "$C_OFF"
   fi
@@ -3857,11 +4251,8 @@ main() {
   fi
 }
 
-AUDIT_TMP=""
-if [[ -z $AUDIT_TMP ]]; then
-  AUDIT_TMP="$(mktemp)"
-  trap 'rm -f "$AUDIT_TMP"' EXIT
-fi
+AUDIT_TMP="$(mktemp)"
+trap 'rm -f "$AUDIT_TMP"' EXIT
 
 # Sourcing this file gives you the functions and runs nothing, which is what
 # the tests in the repo do.

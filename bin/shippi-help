@@ -49,14 +49,14 @@ hotkey() {
 page_commands() {
   clear
   echo ""
-  header "Oma-Pi Commands"
+  header "Shippi Commands"
 
   section "Scripts"
-  cmd "omapi-help"    "Show this help"
-  cmd "omapi-refresh" "Reinstall Oma-Pi with initial configs"
-  cmd "omapi-setup"   "Set git name, email and GitHub CLI auth"
-  cmd "omapi-ssh"     "Add SSH key for remote access"
-  cmd "omapi-harden"  "Run the security hardening tool (try --dry-run first)"
+  cmd "shippi-help"    "Show this help"
+  cmd "shippi-refresh" "Reinstall Shippi with initial configs"
+  cmd "shippi-setup"   "Set git name, email and GitHub CLI auth"
+  cmd "shippi-ssh"     "Add SSH key for remote access"
+  cmd "shippi-harden"  "Run the security hardening tool (try --dry-run first)"
 
   section "AI Tools"
   cmd "oc"  "opencode"
@@ -186,7 +186,7 @@ page_herdr() {
   hotkey "Prefix b"            "Toggle sidebar"
   hotkey "Mouse"               "Click, drag, and right-click to manage panes"
 
-  section "Oma-Pi layouts"
+  section "Shippi layouts"
   cmd "hdl [ai] [ai2]"         "Dev layout: editor + AI pane(s) + terminal"
   cmd "hdlm [ai] [ai2]"        "One hdl tab per subdirectory"
   cmd "hds"                    "Dev square: editor + diff watch + opencode"
@@ -196,14 +196,14 @@ page_herdr() {
 page_hardening() {
   clear
   echo ""
-  header "Security Hardening (omapi-harden)"
+  header "Security Hardening (shippi-harden)"
   echo -e "  ${DIM}Run under sudo. Read the full detail in the repo README.${RESET}"
 
   section "Try it before it changes anything"
-  cmd '$HOME/.local/bin/omapi-harden --list'       "List tasks and exit"
-  cmd 'sudo $HOME/.local/bin/omapi-harden --dry-run' "Print the plan, change nothing"
-  cmd 'sudo $HOME/.local/bin/omapi-harden --yes'     "Take recommended defaults, no prompts"
-  cmd 'sudo $HOME/.local/bin/omapi-harden ssh firewall' "Just named tasks"
+  cmd '$HOME/.local/bin/shippi-harden --list'       "List tasks and exit"
+  cmd 'sudo $HOME/.local/bin/shippi-harden --dry-run' "Print the plan, change nothing"
+  cmd 'sudo $HOME/.local/bin/shippi-harden --yes'     "Take recommended defaults, no prompts"
+  cmd 'sudo $HOME/.local/bin/shippi-harden ssh firewall' "Just named tasks"
 
   section "Tasks (default: all but aide)"
   cmd "packages"   "hardening tooling: ufw, fail2ban, apparmor, ..."
@@ -223,6 +223,7 @@ page_hardening() {
   cmd "--password-ssh"     "keep password login over SSH (default is key-only)"
   cmd "--agent-forwarding" "allow ssh -A (AllowAgentForwarding yes)"
   cmd "--lockdown-ssh"     "also set AllowUsers <you> (needs a key for <you>)"
+  cmd "--ssh-from <cidr>"  "restrict SSH to this source prefix (repeatable; default LAN + tailnet)"
   echo -e "  ${DIM}  key-only is the default; --yes cannot force it past the key check.${RESET}"
 
   section "Other options"
@@ -232,8 +233,8 @@ page_hardening() {
   cmd "-l, --list"   "list tasks and exit"
 
   section "LAN-only box with password login"
-  cmd 'sudo $HOME/.local/bin/omapi-harden --password-ssh --dry-run' "then, if it looks right:"
-  cmd 'sudo $HOME/.local/bin/omapi-harden --password-ssh --yes'     "prompts default sensibly"
+  cmd 'sudo $HOME/.local/bin/shippi-harden --password-ssh --dry-run' "then, if it looks right:"
+  cmd 'sudo $HOME/.local/bin/shippi-harden --password-ssh --yes'     "prompts default sensibly"
   echo -e "  ${DIM}  Passwords are quality-checked but do not expire on a timer.${RESET}"
 }
 

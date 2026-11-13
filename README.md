@@ -1,4 +1,4 @@
-# Oma-Pi
+# Shippi
 
 A minimal setup for debian based systems like Raspberry Pi OS Lite and Ubuntu in the spirit of Omarchy/[Omaterm](https://github.com/omacom-io/omaterm). This has only been tested on a Raspberry Pi 5 with 8GB ram and SSD storage.
 
@@ -8,7 +8,7 @@ A minimal setup for debian based systems like Raspberry Pi OS Lite and Ubuntu in
   - Tested on Raspberry Pi OS Lite / Debian 12 (bookworm).
   - **Ubuntu 24.04 (noble) or newer.** Ubuntu moved sshd to systemd socket
     activation in 22.10. On 24.04 and later a `Port` change in
-    `sshd_config` is read by a systemd generator, so `omapi-harden` can move
+    `sshd_config` is read by a systemd generator, so `shippi-harden` can move
     the port by reloading and restarting `ssh.socket`. On 22.10 through
     23.10 there is no such generator: `ssh.socket` uses a fixed
     `ListenStream=22`, the `Port` directive is ignored, and the script would
@@ -18,7 +18,7 @@ A minimal setup for debian based systems like Raspberry Pi OS Lite and Ubuntu in
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/woodcox/oma-pi/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/woodcox/shippi-server/main/install.sh | bash
 
 ```
 
@@ -59,15 +59,15 @@ And you'll be offered to setup:
 > Security note: the installer adds the user to the `docker` group which grants root-level privileges to the user. For details on how this impacts security in your system, see [Docker Daemon Attack Surface](https://docs.docker.com/engine/security/#docker-daemon-attack-surface). If you decline, use `sudo docker ...`.
 
 ## Commands
-See `omapi-help` for the command list and Herdr key bindings, and the
+See `shippi-help` for the command list and Herdr key bindings, and the
 [Herdr docs](https://herdr.dev/docs/) for the full manual. Herdr replaces tmux:
 tabs are tmux windows, workspaces are tmux sessions, and `h` attaches to the
-persistent `Work` session. Oma-Pi provides:
+persistent `Work` session. Shippi provides:
 
- - `omapi-setup`: Git name and email and github cli
- - `omapi-refresh`: Reinstall Oma-pi with initial configs
- - `omapi-ssh`: Add SSH key for remote access
- - `omapi-harden`: One-time security hardening — run `omapi-harden --dry-run` first. See security hardening section for further details
+ - `shippi-setup`: Git name and email and github cli
+ - `shippi-refresh`: Reinstall Shippi with initial configs
+ - `shippi-ssh`: Add SSH key for remote access
+ - `shippi-harden`: One-time security hardening — run `shippi-harden --dry-run` first. See security hardening section for further details
 
  - [opencode](https://opencode.ai/): alias `oc`
  - Claude: alias `cc=printf "\033[2J\033[3J\033[H" && claude --permission-mode bypassPermissions`
@@ -125,11 +125,11 @@ for further info.
 
 ## Security hardening
 
-After installing you can run `omapi-harden` which applies the following hardening: 
+After installing you can run `shippi-harden` which applies the following hardening: 
 sshd hardening, ufw with only the ports you actually run exposed, fail2ban, automatic
 security updates, AppArmor, kernel and network sysctls, password quality
 checks, and service minimisation (it offers to disable things a headless server
-does not need, such as cups, Bluetooth and triggerhappy). 
+does not need, such as cups, Bluetooth and triggerhappy).
 
 Passwords do not expire on a timer. Forced rotation mostly produces predictable
 increments, and on a headless key-only box an expired password can lock out the
@@ -172,10 +172,11 @@ root to read `/etc/ufw/after.rules` (`0640 root:root`); without it the
 
 ```bash
 
-sudo $HOME/.local/bin/omapi-harden --list       # available tasks
-sudo $HOME/.local/bin/omapi-harden ssh firewall  # just these two
-sudo $HOME/.local/bin/omapi-harden --yes         # take the recommended defaults
-./test/omapi-harden-test.sh              # test suite does not need root access
+sudo $HOME/.local/bin/shippi-harden --list       # available tasks
+sudo $HOME/.local/bin/shippi-harden ssh firewall  # just these two
+sudo $HOME/.local/bin/shippi-harden --yes         # take the recommended defaults
+sudo $HOME/.local/bin/shippi-harden --ssh-from 192.168.1.0/24 firewall
+./test/shippi-harden-test.sh              # test suite does not need root access
 ```
 
 If you would rather do it by hand, please see the three hardening guides below:
@@ -204,6 +205,25 @@ Some deliberate choices worth knowing before you run it:
   restriction, sshd would match it against the IP only and reject the key, so
   the task warns and writes `UseDNS yes` instead. IP/CIDR `from=` rules are not
   affected.
+- **SSH is not exposed to the world after a successful run.** The firewall task
+  rate-limits SSH from the LAN prefixes on the interface carrying the default
+  route, and allows it on `tailscale0`; it removes the blanket `ufw allow`
+  and `ufw limit` rules for both `<port>/tcp` and protocol-unspecified
+  `<port>` written by earlier versions, and it removes scoped permits left by
+  an earlier `--ssh-from`
+  choice. If no usable LAN or tailnet permit can be established, the firewall
+  task stops before changing the default policy; if a requested source fails,
+  it keeps the existing blanket rule and reports the task incomplete. If no LAN
+  prefix is detected but Tailscale is available, it closes the blanket rule
+  anyway and leaves SSH reachable over `tailscale0` only; new LAN logins will
+  be refused, so verify a tailnet session first. It also reports incomplete
+  when a stale scoped or blanket rule cannot be removed. `.local` names keep
+  working because UFW's stock `before.rules` already permits mDNS on 5353, and
+  the LAN rule covers the private IPv4 subnet and the on-link IPv6 prefixes
+  avahi advertises. IPv6-only and public-IPv4 LANs are not auto-detected; pass
+  `--ssh-from <cidr>` one or more times to replace the detected prefixes.
+  Existing sessions stay up, but verify a new login from each allowed source
+  before closing the old one.
 - **Prompts use `gum`**, reading `/dev/tty` directly, so they still appear when
   the script is iterating over ports or accounts. Without a terminal at all it
   says so and takes the documented default rather than silently guessing.
@@ -245,7 +265,9 @@ Some deliberate choices worth knowing before you run it:
   apt's management so it quietly stops receiving patches. That check is scoped
   to kernel images: a Pi's `initrd.img-*`, `cmdline.txt` and `overlays` are
   untracked by design, and a check that fires on every machine is one nobody
-  reads.
+  reads. The audit also reports `/var/run/reboot-required` and the packages
+  that set it, because a package-owned `/boot` with zero pending updates still
+  looks clean while a just-installed kernel waits for a reboot.
 - **`net.ipv4.ip_forward` is left alone** when the Docker service is *running*,
   since the container bridge needs it. If Docker is installed but stopped when
   you run the script, forwarding is turned off; start Docker and re-run if that
@@ -254,7 +276,7 @@ Some deliberate choices worth knowing before you run it:
   depends on it. Agent forwarding is a different feature and is off by default:
   `AllowAgentForwarding no` stops a compromised remote host from using every key
   loaded in your local agent. If a workflow genuinely needs `ssh -A` into this
-  box, add `--agent-forwarding` to the omapi run. Both values are always written
+  box, add `--agent-forwarding` to the shippi run. Both values are always written
   into the managed block, so the setting sticks: the block is prepended and sshd
   takes the first value it reads, which is also why a drop-in cannot override it.
 - **Wi-Fi and Bluetooth radios are not disabled.** That needs a `sudo nano /boot/config.txt`

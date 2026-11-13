@@ -1,24 +1,37 @@
 #!/usr/bin/env bash
 #
-# Tests for omapi-harden. Sourced, never executed, so main() never runs.
+# Tests for shippi-harden. Sourced, never executed, so main() never runs.
 #
 # The interesting tests here are the ones that check the script cannot lock
 # you out of your own machine. A hardening script is only ever as good as
 # its worst failure mode, and that failure mode is a Pi you cannot ssh into.
 #
-# Run: ./test/omapi-harden-test.sh
+# Run: ./test/shippi-harden-test.sh
 set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="$TEST_DIR/bin/omapi-harden"
+SCRIPT="$TEST_DIR/bin/shippi-harden"
 PASS=0
 FAIL=0
 # Test functions already run, so t() can reject a duplicate registration
 # rather than silently running the same test twice and counting it twice.
 _SEEN_TESTS=()
 
-# shellcheck source=../bin/omapi-harden
+# /tmp is world-writable, and key_strict_modes_ok correctly rejects a key whose
+# parent chain includes it. Keep mktemp output under a private parent so the
+# StrictModes tests check the tree they build rather than /tmp itself.
+TEST_TMP="$(mktemp -d "${HOME}/.shippi-harden-test.XXXXXX")" || {
+  echo "could not create a private temp dir under $HOME" >&2
+  exit 1
+}
+export TMPDIR="$TEST_TMP"
+
+# shellcheck source=../bin/shippi-harden
 source "$SCRIPT"
+
+# The sourced script installs an EXIT trap for its audit temp file. Replace it
+# with one that cleans both that file and this suite's private temp root.
+trap 'rm -rf "$TEST_TMP"; rm -f "$AUDIT_TMP"' EXIT
 
 # Snapshot the script's own functions, so t() can tell when a test has
 # redefined one without registering it. Built once, immediately after the
@@ -35,11 +48,13 @@ done
 unset _f
 
 setup_destdir() {
-  OMAPI_SECURITY_DESTDIR="$(mktemp -d)"
-  export OMAPI_SECURITY_DESTDIR
-  CONF_DEST="$OMAPI_SECURITY_DESTDIR"
+  SHIPPI_SECURITY_DESTDIR="$(mktemp -d)"
+  export SHIPPI_SECURITY_DESTDIR
+  CONF_DEST="$SHIPPI_SECURITY_DESTDIR"
   DRY_RUN=0
   ASSUME_YES=1
+  SSH_FROM=()
+  SSH_LAN_APPLIED=()
   # Stub every privileged call. Without this the tests are not "no root
   # needed" at all: on a machine with passwordless sudo, or a CI runner, the
   # configure_* functions would restart journald, run `sysctl --system`,
@@ -61,7 +76,7 @@ setup_destdir() {
   # (they are safe in a destdir); everything else is just logged.
   run_root() {
     # Mirror the real run_root's dry-run contract: print the command, run
-    # nothing. Before omapi-harden delegated its services dry-run print to
+    # nothing. Before shippi-harden delegated its services dry-run print to
     # run_root, no dry-run path reached this stub, so DRY_RUN-blindness was
     # invisible; now the blocker would print "[stub] run_root" instead of the
     # plan and "disabled" success lines that a real dry run does not show.
@@ -94,7 +109,14 @@ setup_destdir() {
   # does not bail early on a box without unattended-upgrades installed, and
   # runs its own post-write checks.
   stub peek
-  peek() { return 1; }
+  peek() {
+    # No managed scoped SSH rules by default. Tests that care about stale
+    # permits override this with a `ufw show added` fixture.
+    case "$*" in
+      'ufw show added') return 0 ;;
+      *) return 1 ;;
+    esac
+  }
 }
 
 # Every function name a test stubs is recorded here so teardown_destdir can
@@ -141,7 +163,7 @@ teardown_destdir() {
   [[ -n ${_SAVED_PEEK:-} ]] && eval "$_SAVED_PEEK"
   _SAVED_HAVE="" _SAVED_RUN_ROOT="" _SAVED_PRIV="" _SAVED_PEEK=""
   [[ -n $CONF_DEST ]] && rm -rf "$CONF_DEST"
-  unset OMAPI_SECURITY_DESTDIR
+  unset SHIPPI_SECURITY_DESTDIR
   CONF_DEST=""
   DRY_RUN=0
   ASSUME_YES=0
@@ -150,6 +172,8 @@ teardown_destdir() {
   # choice into whatever runs next.
   AGENT_FORWARDING=0
   PASSWORD_SSH=0
+  SSH_FROM=()
+  SSH_LAN_APPLIED=()
 }
 
 # A bash function returns the exit status of its LAST command. Every test that
@@ -345,7 +369,7 @@ test_no_lockout_with_second_path_only() {
   setup_destdir
   local home; home="$(mktemp -d)"
   mkdir -p "$home/.ssh"
-  ssh-keygen -q -t ed25519 -N '' -C 'second@omapi' -f "$home/id" </dev/null >/dev/null 2>&1
+  ssh-keygen -q -t ed25519 -N '' -C 'second@shippi' -f "$home/id" </dev/null >/dev/null 2>&1
   cp "$home/id.pub" "$home/.ssh/authorized_keys2"
   chmod 600 "$home/.ssh/authorized_keys2"
 
@@ -363,7 +387,7 @@ test_usable_key_rejects_real_private_key() {
   # wrong reason.
   setup_destdir
   local d; d="$(mktemp -d)"
-  ssh-keygen -q -t ed25519 -N '' -C 'priv@omapi' -f "$d/id" </dev/null >/dev/null 2>&1
+  ssh-keygen -q -t ed25519 -N '' -C 'priv@shippi' -f "$d/id" </dev/null >/dev/null 2>&1
   local rc=0
   # Sanity: ssh-keygen really does accept it, which is why the guard is needed.
   ssh-keygen -l -f "$d/id" &>/dev/null || rc=1
@@ -386,7 +410,7 @@ test_usable_key_rejects_empty_file() {
 
 test_usable_key_accepts_real_key() {
   local f; f="$(mktemp -d)"
-  ssh-keygen -q -t ed25519 -N '' -C 'test@omapi' -f "$f/id" </dev/null >/dev/null 2>&1 || return 1
+  ssh-keygen -q -t ed25519 -N '' -C 'test@shippi' -f "$f/id" </dev/null >/dev/null 2>&1 || return 1
   cat "$f/id.pub" >"$f/authorized_keys"
   have_usable_key "$f/authorized_keys"
   local rc=$?
@@ -446,7 +470,7 @@ EOF
   [[ $parsed == *"tcp 22"* ]]
 }
 
-# Runs the REAL parser from omapi-harden against the given fixture. A copied
+# Runs the REAL parser from shippi-harden against the given fixture. A copied
 # duplicate of the awk program is what let a broken parser pass its own test.
 _parse_ports() {
   listening_ports "$1"
@@ -476,7 +500,7 @@ test_apt_config_origins_match_os_release() {
   local codename
   codename="$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/, "", $2); print $2}' /etc/os-release)"
   [[ -n $codename ]] || { teardown_destdir; return 0; }
-  grep -q "${codename}-security" "$CONF_DEST/etc/apt/apt.conf.d/51omapi-origins"
+  grep -q "${codename}-security" "$CONF_DEST/etc/apt/apt.conf.d/51shippi-origins"
   local rc=$?
   teardown_destdir
   return $rc
@@ -523,7 +547,7 @@ test_rpi_archive_is_allowed_when_this_box_has_it() {
     printf ' 500 http://archive.raspberrypi.com/debian bookworm/main arm64 Packages\n%s\n' "$release"
   }
   configure_updates >/dev/null 2>&1
-  local cfg="$CONF_DEST/etc/apt/apt.conf.d/51omapi-origins" rc=0
+  local cfg="$CONF_DEST/etc/apt/apt.conf.d/51shippi-origins" rc=0
   [[ -f $cfg ]] || rc=1
   grep -qF '"Raspberry Pi Foundation:bookworm";' "$cfg" || rc=1
   teardown_destdir
@@ -537,7 +561,7 @@ test_third_party_repos_are_never_auto_upgraded() {
   # stack is a far worse outcome than a patch that waits for a human.
   setup_destdir
   configure_updates >/dev/null 2>&1
-  local cfg="$CONF_DEST/etc/apt/apt.conf.d/51omapi-origins" rc=0
+  local cfg="$CONF_DEST/etc/apt/apt.conf.d/51shippi-origins" rc=0
   [[ -f $cfg ]] || rc=1
   grep -qiE 'tailscale|docker|charm|gierens|"gh:|cli\.github' "$cfg" && rc=1
   teardown_destdir
@@ -671,7 +695,7 @@ test_dry_run_touches_nothing() {
   local before rc=0
   before="$(cat "$CONF_DEST/etc/ssh/sshd_config")"
   DRY_RUN=1
-  write_conf /etc/fail2ban/jail.d/omapi-hardening.local <<<'ignored'
+  write_conf /etc/fail2ban/jail.d/shippi-hardening.local <<<'ignored'
   local block; block="$(mktemp)"
   printf '%s\nPasswordAuthentication no\n%s\n' "$MANAGED_BEGIN" "$MANAGED_END" >"$block"
   replace_managed_block "$block" /etc/ssh/sshd_config
@@ -842,7 +866,7 @@ test_force_flag_is_not_accepted() {
   # script must never offer. It has been removed, so it must now be rejected.
   #
   # Uses `bash "$SCRIPT"` and the same rc-then-assert shape as
-  # test_unknown_option_rejected: the earlier version ran omapi-harden with
+  # test_unknown_option_rejected: the earlier version ran shippi-harden with
   # `|| rc=1` under a test-local `local rc=0`, so the non-zero exit it saw
   # from the rejection and the non-zero exit it expected were indistinguishable.
   local out rc
@@ -930,15 +954,15 @@ test_docker_loopback_survives_a_missing_protocol_suffix() {
 
 test_dry_run_does_not_create_directories() {
   # `install -d` used to run before the dry-run return in
-  # replace_managed_block, so `omapi-harden --dry-run` created /etc/ssh and
+  # replace_managed_block, so `shippi-harden --dry-run` created /etc/ssh and
   # /etc/ufw. A dry run that mutates the filesystem is not a dry run.
   setup_destdir
   local rc=0 d="$CONF_DEST/etc/brand-new-dir"
   DRY_RUN=1
   local block; block="$(mktemp)"
-  printf '# BEGIN OMAPI MANAGED\nx\n# END OMAPI MANAGED\n' >"$block"
+  printf '# BEGIN SHIPPI MANAGED\nx\n# END SHIPPI MANAGED\n' >"$block"
   replace_managed_block "$block" /etc/brand-new-dir/file.conf \
-    '# BEGIN OMAPI MANAGED' '# END OMAPI MANAGED' >/dev/null 2>&1
+    '# BEGIN SHIPPI MANAGED' '# END SHIPPI MANAGED' >/dev/null 2>&1
   rm -f "$block"
   DRY_RUN=0
   if [[ -d $d ]]; then
@@ -1179,7 +1203,7 @@ test_a_failing_awk_in_the_port_rewrite_is_not_silent() {
   # GLM finding 3. A failure inside `awk && cat && rm` is exempt from set -e, so
   # the Port rewrite used to fail silently: harden_ssh returned 0, printed
   # "sshd accepts the new config", left two active `Port` lines and a stray
-  # .omapi-tmp, and warned about nothing. A config write that failed silently
+  # .shippi-tmp, and warned about nothing. A config write that failed silently
   # is the worst case there is here.
   setup_destdir
   local rc=0
@@ -1210,8 +1234,8 @@ test_a_failing_awk_in_the_port_rewrite_is_not_silent() {
     rc=1
   fi
   # And no temp file left behind.
-  if [[ -n $(find "$CONF_DEST" -name '*.omapi-tmp' 2>/dev/null) ]]; then
-    printf '        a .omapi-tmp file was left behind after the failure\n'
+  if [[ -n $(find "$CONF_DEST" -name '*.shippi-tmp' 2>/dev/null) ]]; then
+    printf '        a .shippi-tmp file was left behind after the failure\n'
     rc=1
   fi
   teardown_destdir
@@ -1378,8 +1402,8 @@ test_passwordless_sudo_is_reported() {
   printf 'Defaults env_reset\nroot ALL=(ALL:ALL) ALL\n# alice ALL=(ALL) NOPASSWD: ALL\n' >"$t/sudoers"
   printf 'bob ALL=(ALL) NOPASSWD: ALL\n' >"$t/sudoers.d/bob"
   printf 'carol ALL=(ALL) !authenticate\n' >"$t/sudoers.d/carol"
-  export OMAPI_SUDOERS="$t/sudoers"
-  export OMAPI_SUDOERS_DIR="$t/sudoers.d"
+  export SHIPPI_SUDOERS="$t/sudoers"
+  export SHIPPI_SUDOERS_DIR="$t/sudoers.d"
 
   stub peek
   peek() { "$@"; }
@@ -1401,7 +1425,7 @@ test_passwordless_sudo_is_reported() {
     printf '        a commented rule was reported as active\n'
     rc=1
   }
-  unset OMAPI_SUDOERS OMAPI_SUDOERS_DIR
+  unset SHIPPI_SUDOERS SHIPPI_SUDOERS_DIR
   rm -rf "$t"
   teardown_destdir
   return $rc
@@ -1414,8 +1438,8 @@ test_passwordless_sudo_clean_is_not_a_warning() {
   mkdir -p "$t/sudoers.d"
   printf 'Defaults env_reset\nroot ALL=(ALL:ALL) ALL\n%%sudo ALL=(ALL:ALL) ALL\n' >"$t/sudoers"
   printf '# bob ALL=(ALL) NOPASSWD: ALL\n' >"$t/sudoers.d/old"
-  export OMAPI_SUDOERS="$t/sudoers"
-  export OMAPI_SUDOERS_DIR="$t/sudoers.d"
+  export SHIPPI_SUDOERS="$t/sudoers"
+  export SHIPPI_SUDOERS_DIR="$t/sudoers.d"
 
   stub peek
   peek() { "$@"; }
@@ -1430,7 +1454,7 @@ test_passwordless_sudo_clean_is_not_a_warning() {
     printf '        a commented-out rule was treated as a finding\n'
     rc=1
   }
-  unset OMAPI_SUDOERS OMAPI_SUDOERS_DIR
+  unset SHIPPI_SUDOERS SHIPPI_SUDOERS_DIR
   rm -rf "$t"
   teardown_destdir
   return $rc
@@ -1442,8 +1466,8 @@ test_passwordless_sudo_unreadable_is_not_called_clean() {
   setup_destdir
   local rc=0 t out
   t="$(mktemp -d)"
-  export OMAPI_SUDOERS="$t/does-not-exist"
-  export OMAPI_SUDOERS_DIR="$t/sudoers.d"
+  export SHIPPI_SUDOERS="$t/does-not-exist"
+  export SHIPPI_SUDOERS_DIR="$t/sudoers.d"
 
   stub peek
   peek() { "$@"; }
@@ -1458,7 +1482,7 @@ test_passwordless_sudo_unreadable_is_not_called_clean() {
     printf '        an unreadable sudoers was reported clean\n'
     rc=1
   }
-  unset OMAPI_SUDOERS OMAPI_SUDOERS_DIR
+  unset SHIPPI_SUDOERS SHIPPI_SUDOERS_DIR
   rm -rf "$t"
   teardown_destdir
   return $rc
@@ -1473,8 +1497,8 @@ test_passwordless_sudo_unlistable_dropins_is_not_called_clean() {
   t="$(mktemp -d)"
   mkdir -p "$t/sudoers.d"
   printf 'Defaults env_reset\nroot ALL=(ALL:ALL) ALL\n' >"$t/sudoers"
-  export OMAPI_SUDOERS="$t/sudoers"
-  export OMAPI_SUDOERS_DIR="$t/sudoers.d"
+  export SHIPPI_SUDOERS="$t/sudoers"
+  export SHIPPI_SUDOERS_DIR="$t/sudoers.d"
 
   stub peek
   peek() {
@@ -1495,7 +1519,7 @@ test_passwordless_sudo_unlistable_dropins_is_not_called_clean() {
     printf '        an unchecked drop-in directory was reported clean\n'
     rc=1
   }
-  unset OMAPI_SUDOERS OMAPI_SUDOERS_DIR
+  unset SHIPPI_SUDOERS SHIPPI_SUDOERS_DIR
   rm -rf "$t"
   teardown_destdir
   return $rc
@@ -1523,8 +1547,8 @@ EOF
 [Seat:*]
 autologin-user=pi
 EOF
-  export OMAPI_GETTY_DIR="$t/system"
-  export OMAPI_LIGHTDM_DIR="$t/lightdm"
+  export SHIPPI_GETTY_DIR="$t/system"
+  export SHIPPI_LIGHTDM_DIR="$t/lightdm"
 
   out="$(check_console_autologin 2>&1)"
 
@@ -1548,7 +1572,7 @@ EOF
     printf '        a commented-out getty line was reported\n'
     rc=1
   }
-  unset OMAPI_GETTY_DIR OMAPI_LIGHTDM_DIR
+  unset SHIPPI_GETTY_DIR SHIPPI_LIGHTDM_DIR
   rm -rf "$t"
   teardown_destdir
   return $rc
@@ -1567,8 +1591,8 @@ EOF
 [Seat:*]
 # autologin-user=pi
 EOF
-  export OMAPI_GETTY_DIR="$t/system"
-  export OMAPI_LIGHTDM_DIR="$t/lightdm"
+  export SHIPPI_GETTY_DIR="$t/system"
+  export SHIPPI_LIGHTDM_DIR="$t/lightdm"
 
   out="$(check_console_autologin 2>&1)"
 
@@ -1580,7 +1604,7 @@ EOF
     printf '        a commented-out autologin line was treated as a finding\n'
     rc=1
   }
-  unset OMAPI_GETTY_DIR OMAPI_LIGHTDM_DIR
+  unset SHIPPI_GETTY_DIR SHIPPI_LIGHTDM_DIR
   rm -rf "$t"
   teardown_destdir
   return $rc
@@ -1593,7 +1617,7 @@ test_ask_never_passes_a_flag_gum_will_reject() {
   # (whose default is Yes) is used for a default-n prompt.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
   # Only actual invocations, not the comment that explains why the flag is
   # wrong - the file legitimately mentions it there.
   if grep -qE '^[[:space:]]*gum confirm .*--default-no' "$f"; then
@@ -1692,7 +1716,7 @@ test_validator_requires_both_markers() {
   # unprivileged path still refuses rather than claiming success.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
   if ! grep -qF 'grep -qFx "$DOCKER_UFW_BEGIN"' "$f"; then
     printf '        the validator does not require both markers before trusting the parse\n'
     rc=1
@@ -1727,7 +1751,7 @@ test_apparmor_does_not_claim_success_it_cannot_confirm() {
   # literal "?" placeholders and exited 0.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
   if grep -q 'ok "apparmor enabled (\${enforced:-?}' "$f"; then
     printf '        apparmor still reports success unconditionally\n'
     rc=1
@@ -1741,8 +1765,8 @@ test_reachable_is_only_reported_when_the_rule_was_added() {
   # the report, so a rejected rule printed a warning AND a success line.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
-  if grep -q 'comment "omapi: \${name}" || warn "could not add a route rule' "$f"; then
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
+  if grep -q 'comment "shippi: \${name}" || warn "could not add a route rule' "$f"; then
     printf '        the reachable line is still unconditional after a failed rule\n'
     rc=1
   fi
@@ -1762,7 +1786,7 @@ test_unattended_upgrade_check_is_not_tautological() {
   # box this was written on.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
   if grep -q "apt-config dump | grep -q Unattended-Upgrade" "$f"; then
     printf '        still checking for the package config, not for origins\n'
     rc=1
@@ -1819,12 +1843,12 @@ test_harden_ssh_privileged_transaction() {
     local privileged=1 status=0
     command chmod 755 "$d" "$d/sshd_config.d"
     # Inject failures only at the transaction's own staging/backup operations.
-    if [[ $scenario == backup && $1 == cp && ${!#} == "$main.omapi-backup" ]] ||
-       [[ $scenario == stage && $1 == cp && ${!#} == "$main".omapi-stage* ]] ||
-       [[ $scenario == mode && $1 == chmod && ${!#} == "$main".omapi-stage* ]] ||
-       [[ $scenario == owner && $1 == chown && ${!#} == "$main".omapi-stage* ]] ||
-       [[ $scenario == rename && $1 == mv && ${!#} == "$main" && $3 == "$main".omapi-stage* ]] ||
-       [[ $scenario == drop_stage && $1 == cp && ${!#} == "$drop.omapi-tmp" ]]; then
+    if [[ $scenario == backup && $1 == cp && ${!#} == "$main.shippi-backup" ]] ||
+       [[ $scenario == stage && $1 == cp && ${!#} == "$main".shippi-stage* ]] ||
+       [[ $scenario == mode && $1 == chmod && ${!#} == "$main".shippi-stage* ]] ||
+       [[ $scenario == owner && $1 == chown && ${!#} == "$main".shippi-stage* ]] ||
+       [[ $scenario == rename && $1 == mv && ${!#} == "$main" && $3 == "$main".shippi-stage* ]] ||
+       [[ $scenario == drop_stage && $1 == cp && ${!#} == "$drop.shippi-tmp" ]]; then
       injected=1
       [[ $scenario == *stage ]] && printf 'partial\n' >"${!#}"
       status=1
@@ -1863,7 +1887,7 @@ test_harden_ssh_privileged_transaction() {
           assert_eq "$injected" 1 || rc=1
           assert_eq "$(cat "$drop")" "$drop_content" || rc=1
         fi
-        [[ ! -e $drop.omapi-backup ]] || rc=1
+        [[ ! -e $drop.shippi-backup ]] || rc=1
         ;;
       *)
         assert_eq "$hrc" 1 || rc=1
@@ -1879,7 +1903,7 @@ test_harden_ssh_privileged_transaction() {
     esac
     assert_eq "$(stat -c %a "$main")" 640 || rc=1
     assert_eq "$(stat -c %a "$drop")" 600 || rc=1
-    if compgen -G "$main.omapi-stage.*" >/dev/null || [[ -e $main.omapi-tmp || -e $drop.omapi-tmp ]]; then
+    if compgen -G "$main.shippi-stage.*" >/dev/null || [[ -e $main.shippi-tmp || -e $drop.shippi-tmp ]]; then
       printf '        %s: staging file left behind\n' "$scenario"
       rc=1
     fi
@@ -1904,7 +1928,7 @@ test_harden_ssh_write_preserves_mode() {
   local drop_dir="$ssh_dir/sshd_config.d"
   mkdir -p "$drop_dir"
   local main="$ssh_dir/sshd_config"
-  local drop="$drop_dir/99-omapi.conf"
+  local drop="$drop_dir/99-shippi.conf"
   printf 'Port 22\nPermitRootLogin yes\n' >"$main"; chmod 600 "$main"
   # 0600 for the drop-in too, deliberately. At 0644 the staged file inherits the
   # same mode, so an unguarded rename is invisible - which is how the missing
@@ -1946,9 +1970,9 @@ test_harden_ssh_write_preserves_mode() {
     rc=1
   fi
   # And no staging file may survive a successful write. The main file's stage
-  # is .omapi-stage.$$ (install_staged), the drop-ins' is .omapi-tmp.
+  # is .shippi-stage.$$ (install_staged), the drop-ins' is .shippi-tmp.
   local leftovers
-  leftovers="$((compgen -G "$ssh_dir/sshd_config.omapi-stage.*" >/dev/null 2>&1 && echo x; ls "$ssh_dir"/*.omapi-tmp "$drop_dir"/*.omapi-tmp 2>/dev/null) | wc -l)"
+  leftovers="$((compgen -G "$ssh_dir/sshd_config.shippi-stage.*" >/dev/null 2>&1 && echo x; ls "$ssh_dir"/*.shippi-tmp "$drop_dir"/*.shippi-tmp 2>/dev/null) | wc -l)"
   if [[ $leftovers -ne 0 ]]; then
     printf '        %s staging file(s) left behind\n' "$leftovers"
     rc=1
@@ -1965,7 +1989,7 @@ test_harden_ssh_survives_an_unopenable_tty() {
   # anything was written. Reproduced here.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
   # The probe must actually open the tty, not just test for it.
   if ! grep -q '(: </dev/tty) 2>/dev/null' "$f"; then
     printf '        /dev/tty is still only tested for existence, not opened\n'
@@ -1987,12 +2011,12 @@ test_mode_is_applied_before_the_rename_not_after() {
   # see this from the suite.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
-  if grep -qE 'mv -f "\$dropin\.omapi-tmp" "\$dropin".*chmod "\$dmode" "\$dropin"' "$f"; then
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
+  if grep -qE 'mv -f "\$dropin\.shippi-tmp" "\$dropin".*chmod "\$dmode" "\$dropin"' "$f"; then
     printf '        the drop-in mode is applied AFTER the rename\n'
     rc=1
   fi
-  if ! grep -q 'chmod "\$dmode" "\$dropin.omapi-tmp"' "$f"; then
+  if ! grep -q 'chmod "\$dmode" "\$dropin.shippi-tmp"' "$f"; then
     printf '        the mode is not applied to the staging file before mv\n'
     rc=1
   fi
@@ -2139,7 +2163,7 @@ test_managed_block_preserves_mode_and_owner_in_practice() {
     printf '        the existing rule was lost\n'
     rc=1
   fi
-  if ls "${f}.omapi-stage."* >/dev/null 2>&1; then
+  if ls "${f}.shippi-stage."* >/dev/null 2>&1; then
     printf '        a staging file was left behind\n'
     rc=1
   fi
@@ -2154,7 +2178,7 @@ test_managed_block_rewrite_allowed_when_remainder_is_empty() {
   # use the exit status, and only refuse when BOTH reads fail.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
   if grep -q '\[\[ -s \$target && -z \$tail \]\]' "$f"; then
     printf '        readability is still judged by an empty remainder\n'
     rc=1
@@ -2172,7 +2196,7 @@ test_ufw_snapshot_cleanup_uses_run_root() {
   # the temp file is left behind in /tmp on every run.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
   if grep -qE '^[[:space:]]*rm -f "\$rules_backup"' "$f"; then
     printf '        an unprivileged rm of the ufw snapshot is still present\n'
     rc=1
@@ -2283,7 +2307,7 @@ test_ufw_rules_snapshot_is_taken_with_run_root() {
   # while the code reported that it had a backup. Assert it is privileged.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
   if grep -qE '^[[:space:]]*cp -p "\$\{CONF_DEST\}/etc/ufw/after6?\.rules"' "$f"; then
     printf '        an unprivileged cp of the ufw rules files is still present\n'
     rc=1
@@ -2304,7 +2328,7 @@ test_replace_managed_block_reads_target_via_peek() {
   # the test user can read, and only /etc/ufw/*.rules is 0640 root:root.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
   if grep -qE "^[[:space:]]*awk -v b1=.*\"\\\$target\" >\"\\\$body\.tail\"" "$f"; then
     printf '        replace_managed_block still reads the target with a bare awk\n'
     rc=1
@@ -2323,7 +2347,7 @@ test_replace_managed_block_writes_target_atomically() {
   # The content must be staged beside the target and renamed into place.
   setup_destdir
   local rc=0
-  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/omapi-harden"
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
   if grep -qE 'run_root cat "\$body" >"\$target"' "$f"; then
     printf '        the target is written by an unprivileged redirection\n'
     rc=1
@@ -2437,7 +2461,7 @@ test_bad_task_before_any_change() {
   # The task list is validated before a single step runs, so a typo cannot
   # half-harden a box.
   local out rc
-  out="$(OMAPI_SECURITY_DESTDIR="$(mktemp -d)" bash "$SCRIPT" --yes packages not-a-task 2>&1)"
+  out="$(SHIPPI_SECURITY_DESTDIR="$(mktemp -d)" bash "$SCRIPT" --yes packages not-a-task 2>&1)"
   rc=$?
   [[ $rc -ne 0 ]] && assert_contains "$out" "unknown task"
 }
@@ -2479,7 +2503,7 @@ test_sysctl_file_has_no_bogus_keys() {
   # "permission denied" and worth catching in a test rather than in a log.
   setup_destdir
   configure_sysctl >/dev/null 2>&1
-  local f="$CONF_DEST/etc/sysctl.d/99-omapi-hardening.conf"
+  local f="$CONF_DEST/etc/sysctl.d/99-shippi-hardening.conf"
   local bad
   bad="$(sysctl -p "$f" 2>&1 | grep -vi 'permission denied' || true)"
   if [[ -n $bad ]]; then
@@ -2499,7 +2523,7 @@ test_ip_forward_never_disabled_when_docker_runs() {
   stub docker_present
   docker_present() { return 0; }
   configure_sysctl >/dev/null 2>&1
-  local f="$CONF_DEST/etc/sysctl.d/99-omapi-hardening.conf"
+  local f="$CONF_DEST/etc/sysctl.d/99-shippi-hardening.conf"
   local rc=0
   if [[ -f $f ]] && grep -qE '^\s*net\.ipv4\.ip_forward\s*=\s*0' "$f"; then
     printf '        ip_forward = 0 was written while Docker is present\n'
@@ -2517,7 +2541,7 @@ test_ip_forward_zeroed_when_no_docker() {
   stub docker_present
   docker_present() { return 1; }
   configure_sysctl >/dev/null 2>&1
-  local f="$CONF_DEST/etc/sysctl.d/99-omapi-hardening.conf"
+  local f="$CONF_DEST/etc/sysctl.d/99-shippi-hardening.conf"
   local rc=0
   if ! grep -qE '^\s*net\.ipv4\.ip_forward\s*=\s*0' "$f"; then
     printf '        ip_forward = 0 missing with no Docker present\n'
@@ -2556,7 +2580,7 @@ test_apt_config_parses_with_real_apt() {
   # against the system config instead of the generated one.
   setup_destdir
   configure_updates >/dev/null 2>&1
-  local cfg="$CONF_DEST/etc/apt/apt.conf.d/51omapi-origins"
+  local cfg="$CONF_DEST/etc/apt/apt.conf.d/51shippi-origins"
   local out rc=0
   if have apt-config; then
     out="$(APT_CONFIG="$cfg" apt-config dump 2>&1)"
@@ -2580,7 +2604,7 @@ test_apt_config_parses_with_real_apt() {
 test_fail2ban_jail_parses_as_ini() {
   setup_destdir
   configure_fail2ban >/dev/null 2>&1
-  local f="$CONF_DEST/etc/fail2ban/jail.d/omapi-hardening.local"
+  local f="$CONF_DEST/etc/fail2ban/jail.d/shippi-hardening.local"
   local rc=0
   if [[ -f $f ]] && have python3; then
     if ! python3 -c "
@@ -2602,7 +2626,7 @@ test_ask_uses_gum_not_a_tty_check() {
   # The per-port and per-account loops put the loop list on stdin, so `[[ -t 0 ]]`
   # is false inside them and ask silently took its default: every passwordless
   # account locked and every unidentified port closed, with no prompt shown.
-  # gum reads /dev/tty and works regardless, and is what the rest of oma-pi
+  # gum reads /dev/tty and works regardless, and is what the rest of shippi
   # uses. Reading the real function body guards the fix.
   local body rc=0
   body="$_ORIGINAL_ASK"
@@ -2618,7 +2642,7 @@ test_ask_uses_gum_not_a_tty_check() {
 }
 
 test_lockout_prompt_defaults_to_no() {
-  # `sudo omapi-harden --yes` must NOT be able to disable SSH passwords with
+  # `sudo shippi-harden --yes` must NOT be able to disable SSH passwords with
   # no verified way back in. ask returning its default under --yes means the
   # default has to be n.
   local body rc=0
@@ -2640,7 +2664,7 @@ test_lockout_prompt_defaults_to_no() {
 }
 
 test_lockdown_ssh_never_writes_allowusers_root() {
-  # Under `sudo omapi-harden`, id -un is root. AllowUsers root next to
+  # Under `sudo shippi-harden`, id -un is root. AllowUsers root next to
   # PermitRootLogin no is a config sshd -t accepts and that locks out every
   # account, so the bare $(id -un) must not be what gets written.
   local body rc=0
@@ -2678,7 +2702,7 @@ test_apt_periodic_keys_are_preserved() {
   grep -q 'APT::Periodic::Update-Package-Lists "1"' "$f" || rc=1
   grep -q 'APT::Periodic::Unattended-Upgrade "1"' "$f" || rc=1
   # And the policy must live in its own file, not overwrite the managed one.
-  [[ -f $CONF_DEST/etc/apt/apt.conf.d/51omapi-origins ]] || rc=1
+  [[ -f $CONF_DEST/etc/apt/apt.conf.d/51shippi-origins ]] || rc=1
   teardown_destdir
   return $rc
 }
@@ -2796,8 +2820,8 @@ test_pending_reboot_summary_reads_packages() {
   t="$(mktemp -d)"
   : >"$t/reboot-required"
   printf 'linux-image-6.12\nlibc6\nlinux-image-6.12\n' >"$t/pkgs"
-  export OMAPI_REBOOT_REQUIRED="$t/reboot-required"
-  export OMAPI_REBOOT_PKGS="$t/pkgs"
+  export SHIPPI_REBOOT_REQUIRED="$t/reboot-required"
+  export SHIPPI_REBOOT_PKGS="$t/pkgs"
 
   if [[ $(pending_reboot_summary) != 'yes (libc6 linux-image-6.12)' ]]; then
     printf '        packages that requested the reboot were not listed\n'
@@ -2808,7 +2832,7 @@ test_pending_reboot_summary_reads_packages() {
     printf '        a missing marker was not reported as no reboot\n'
     rc=1
   }
-  unset OMAPI_REBOOT_REQUIRED OMAPI_REBOOT_PKGS
+  unset SHIPPI_REBOOT_REQUIRED SHIPPI_REBOOT_PKGS
   rm -rf "$t"
   return $rc
 }
@@ -2830,7 +2854,7 @@ test_newest_installed_kernel_sorts_versions() {
   : >"$t/vmlinuz-7.0.0-arm64"
   : >"$t/vmlinuz-6.12.109+rpt-rpi-2712"
   : >"$t/vmlinuz-6.12.109+rpt-rpi-v8"
-  export OMAPI_BOOT_DIR="$t"
+  export SHIPPI_BOOT_DIR="$t"
 
   if [[ $(newest_installed_kernel '6.1.0-25-amd64') != '6.12.0-30-amd64' ]]; then
     printf '        version sort did not pick the newest kernel\n'
@@ -2859,7 +2883,7 @@ test_newest_installed_kernel_sorts_versions() {
     printf '        an empty boot directory returned a kernel\n'
     rc=1
   fi
-  unset OMAPI_BOOT_DIR
+  unset SHIPPI_BOOT_DIR
   rm -rf "$t"
   return $rc
 }
@@ -2910,12 +2934,12 @@ test_firewall_loop_visits_every_port() {
   listening_ports() { printf 'tcp 80\ntcp 443\nudp 3478\n'; }
   stub current_ssh_port
   current_ssh_port() { printf '22\n'; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
   stub listening_process
   listening_process() { printf 'nginx\n'; }
   stub docker_present
   docker_present() { return 1; }
-  stub docker_published_by
-  docker_published_by() { printf ''; }
   stub have
   have() { return 0; }
   stub ask
@@ -2953,12 +2977,12 @@ test_firewall_skips_the_ssh_port() {
   listening_ports() { printf 'tcp 22\ntcp 80\n'; }
   stub current_ssh_port
   current_ssh_port() { printf '22\n'; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
   stub listening_process
   listening_process() { printf 'sshd\n'; }
   stub docker_present
   docker_present() { return 1; }
-  stub docker_published_by
-  docker_published_by() { printf ''; }
   stub have
   have() { return 0; }
   stub ask
@@ -2970,6 +2994,571 @@ test_firewall_skips_the_ssh_port() {
   [[ " ${asked[*]-} " != *"tcp/22"* ]] || rc=1
   [[ " ${asked[*]-} " == *"tcp/80"* ]] || rc=1
   teardown_destdir
+  return $rc
+}
+
+test_firewall_no_deletes_an_existing_allow_rule() {
+  # Answering "no" used to skip adding an allow rule, so a port opened by an
+  # earlier run stayed open while the output claimed it was left closed. The
+  # decline path has to delete the existing rule.
+  setup_destdir
+  DRY_RUN=0
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub listening_ports
+  listening_ports() { printf 'tcp 80\n'; }
+  stub current_ssh_port
+  current_ssh_port() { printf '22\n'; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
+  stub listening_process
+  listening_process() { printf 'nginx\n'; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub have
+  have() { return 0; }
+  stub ask
+  ask() { return 1; }   # answer no to every port
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_firewall >/dev/null 2>&1
+
+  grep -qF 'ufw delete allow 80/tcp' "$log" || {
+    printf '        declining tcp/80 did not delete its allow rule:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_lan_cidrs_reads_the_default_route_interface() {
+  # The LAN is the interface carrying the default route. A hardcoded
+  # 192.168.0.0/16 would either miss the box's real subnet or open every
+  # private network it can route to. Docker and tailscale interfaces are never
+  # LAN sources, and a routed prefix is not the local link.
+  setup_destdir
+  local rc=0 out
+  stub ip
+  ip() {
+    case "$*" in
+      '-4 route show default')
+        printf 'default via 192.168.1.1 dev wlan0 proto dhcp src 192.168.1.118 metric 600\n'
+        ;;
+      '-6 route show default')
+        printf 'default via fe80::1 dev wlan0 proto ra metric 600 pref medium\n'
+        ;;
+      '-4 route show dev wlan0')
+        printf 'default via 192.168.1.1 proto dhcp src 192.168.1.118 metric 600\n'
+        printf '192.168.1.0/24 proto kernel scope link src 192.168.1.118 metric 600\n'
+        ;;
+      '-6 route show dev wlan0')
+        printf '2a0a:ef40:b91:d601::/64 proto ra metric 600 pref medium\n'
+        printf 'fd57:7279:7528::/64 via fe80::1 proto ra metric 600 pref medium\n'
+        printf 'fe80::/64 proto kernel metric 1024 pref medium\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  out="$(lan_cidrs)"
+  [[ $out == *"192.168.1.0/24"* ]] || rc=1
+  [[ $out == *"2a0a:ef40:b91:d601::/64"* ]] || rc=1
+  [[ $out == *"fe80::/64"* ]] || rc=1
+  # A `via` prefix is some other network behind a router, not this link.
+  [[ $out != *"fd57:7279:7528::/64"* ]] || rc=1
+  [[ $out != *"default"* ]] || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_lan_cidrs_does_not_open_a_public_wan() {
+  # On a VPS the default route is a public IPv4 interface. Treating it as the
+  # LAN would recreate the exact public SSH permit this change removes. A
+  # public-IPv4 or IPv6-only LAN can still be described with --ssh-from.
+  setup_destdir
+  local rc=0 out
+  stub ip
+  ip() {
+    case "$*" in
+      '-4 route show default')
+        printf 'default via 203.0.113.1 dev eth0 proto static metric 100\n'
+        ;;
+      '-6 route show default')
+        printf 'default via 2001:db8:1::1 dev eth0 proto static metric 100\n'
+        ;;
+      '-4 route show dev eth0')
+        printf '203.0.113.0/24 proto kernel scope link src 203.0.113.10 metric 100\n'
+        ;;
+      '-6 route show dev eth0')
+        printf '2001:db8:1::/64 proto kernel metric 256 pref medium\n'
+        printf 'fe80::/64 proto kernel metric 256 pref medium\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  out="$(lan_cidrs)"
+  if [[ -n $out ]]; then
+    printf '        a public WAN was treated as the LAN: %s\n' "$out"
+    rc=1
+  fi
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_access_is_scoped_and_removes_the_blanket_rule() {
+  # A bare `ufw limit <port>/tcp` is a public permit. The replacement must add
+  # the LAN and tailnet permits first, then delete the blanket one, so a new
+  # login is never refused in the gap.
+  setup_destdir
+  DRY_RUN=0
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub current_ssh_port
+  current_ssh_port() { printf '1199\n'; }
+  stub listening_ports
+  listening_ports() { printf ''; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
+  stub lan_cidrs
+  lan_cidrs() { printf '192.168.1.0/24\nfd46:fadc:10ef:4115::/64\n'; }
+  stub have
+  have() { return 0; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub ask
+  ask() { return 1; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  mkdir -p "$CONF_DEST/etc/default"
+  printf 'IPV6=yes\n' >"$CONF_DEST/etc/default/ufw"
+
+  configure_firewall >/dev/null 2>&1
+
+  grep -qF 'ufw limit from 192.168.1.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw limit from fd46:fadc:10ef:4115::/64 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw limit in on tailscale0 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw delete limit 1199/tcp' "$log" || rc=1
+  grep -qF 'ufw delete allow 1199/tcp' "$log" || rc=1
+
+  local add_line del_line
+  add_line="$(grep -nF 'ufw limit from 192.168.1.0/24' "$log" | head -1 | cut -d: -f1)"
+  del_line="$(grep -nF 'ufw delete limit 1199/tcp' "$log" | head -1 | cut -d: -f1)"
+  [[ -n $add_line && -n $del_line && $add_line -lt $del_line ]] || {
+    printf '        the blanket rule was removed before the scoped one was added\n'
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_access_closes_blanket_when_only_tailnet_is_known() {
+  # No LAN was detected, but the tailnet permit works. Close the public
+  # blanket rule anyway and warn that new LAN logins will be refused.
+  setup_destdir
+  DRY_RUN=0
+  local log="$CONF_DEST/run_root.log" rc=0 frc=0
+  : >"$log"
+  stub current_ssh_port
+  current_ssh_port() { printf '1199\n'; }
+  stub listening_ports
+  listening_ports() { printf ''; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
+  stub lan_cidrs
+  lan_cidrs() { printf ''; }
+  stub have
+  have() { return 0; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub ask
+  ask() { return 1; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_firewall >/dev/null 2>&1
+  frc=$?
+
+  [[ $frc -eq 0 ]] || {
+    printf '        configure_firewall returned %s, expected success\n' "$frc"
+    rc=1
+  }
+  grep -qF 'ufw limit in on tailscale0 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw delete limit 1199/tcp' "$log" || {
+    printf '        the blanket limit rule was not removed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  grep -qF 'ufw delete allow 1199/tcp' "$log" || {
+    printf '        the blanket allow rule was not removed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  ! grep -qF 'ufw limit from ' "$log" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_from_overrides_lan_detection() {
+  # An explicit --ssh-from is how an operator handles a multi-homed box or a
+  # LAN the default route does not describe. It must replace, not add to,
+  # the auto-detected prefixes.
+  setup_destdir
+  DRY_RUN=0
+  SSH_FROM=(192.168.50.0/24)
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub current_ssh_port
+  current_ssh_port() { printf '1199\n'; }
+  stub listening_ports
+  listening_ports() { printf ''; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
+  stub lan_cidrs
+  lan_cidrs() { printf '10.0.0.0/8\n'; }
+  stub have
+  have() { return 0; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub ask
+  ask() { return 1; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_firewall >/dev/null 2>&1
+
+  grep -qF 'ufw limit from 192.168.50.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  ! grep -qF 'ufw limit from 10.0.0.0/8' "$log" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_ufw_managed_ssh_sources_reads_only_ours() {
+  # Stale-permit reconciliation must not delete a hand-written rule that
+  # happens to match the same source. The comment is the ownership marker.
+  setup_destdir
+  local rc=0 out
+  stub peek
+  peek() {
+    cat <<'EOF'
+Added user rules (see 'ufw status' for running firewall):
+ufw limit from 192.168.1.0/24 to any port 22 proto tcp comment 'shippi: ssh lan'
+ufw limit from 10.0.0.0/8 to any port 22 proto tcp comment 'someone else'
+ufw allow 22/tcp
+EOF
+  }
+  out="$(ufw_managed_ssh_sources 22)"
+  [[ $out == '192.168.1.0/24' ]] || {
+    printf '        unexpected managed sources: %s\n' "$out"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_remove_stale_managed_ssh_rules_keeps_requested() {
+  setup_destdir
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub peek
+  peek() {
+    cat <<'EOF'
+ufw limit from 192.168.1.0/24 to any port 1199 proto tcp comment 'shippi: ssh lan'
+ufw limit from 192.168.50.0/24 to any port 1199 proto tcp comment 'shippi: ssh lan'
+EOF
+  }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  remove_stale_managed_ssh_rules 1199 192.168.50.0/24
+
+  grep -qF 'ufw delete limit from 192.168.1.0/24 to any port 1199 proto tcp' "$log" || {
+    printf '        the stale scoped rule was not deleted:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  ! grep -qF 'ufw delete limit from 192.168.50.0/24 to any port 1199 proto tcp' "$log" || {
+    printf '        the requested scoped rule was deleted:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_tailnet_only_removes_all_managed_ssh_rules() {
+  setup_destdir
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub peek
+  peek() {
+    cat <<'EOF'
+ufw limit from 192.168.1.0/24 to any port 1199 proto tcp comment 'shippi: ssh lan'
+ufw limit from 192.168.50.0/24 to any port 1199 proto tcp comment 'shippi: ssh lan'
+EOF
+  }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  remove_stale_managed_ssh_rules 1199
+
+  grep -qF 'ufw delete limit from 192.168.1.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw delete limit from 192.168.50.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_access_removes_protocolless_blanket_rules() {
+  # `ufw allow 22` is broader than `ufw allow 22/tcp`: it permits both TCP and
+  # UDP. Deleting only the /tcp form leaves SSH publicly reachable.
+  setup_destdir
+  DRY_RUN=0
+  SSH_FROM=(192.168.50.0/24)
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_ssh_access 1199
+
+  grep -qE '^ufw delete allow 1199$' "$log" || {
+    printf '        protocol-less allow rule was not removed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  grep -qE '^ufw delete limit 1199$' "$log" || {
+    printf '        protocol-less limit rule was not removed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  grep -qE '^ufw delete allow 1199/tcp$' "$log" || rc=1
+  grep -qE '^ufw delete limit 1199/tcp$' "$log" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_from_replaces_previous_scoped_rules() {
+  # Running once with --ssh-from A and later with --ssh-from B must remove A.
+  # The old permit otherwise keeps an excluded network able to log in.
+  setup_destdir
+  DRY_RUN=0
+  SSH_FROM=(192.168.50.0/24)
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub peek
+  peek() {
+    printf '%s\n' "ufw limit from 192.168.1.0/24 to any port 1199 proto tcp comment 'shippi: ssh lan'"
+  }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_ssh_access 1199
+
+  grep -qF 'ufw limit from 192.168.50.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw delete limit from 192.168.1.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  ! grep -qF 'ufw delete limit from 192.168.50.0/24' "$log" || rc=1
+  local add_line del_line
+  add_line="$(grep -nF 'ufw limit from 192.168.50.0/24' "$log" | head -1 | cut -d: -f1)"
+  del_line="$(grep -nF 'ufw delete limit from 192.168.1.0/24' "$log" | head -1 | cut -d: -f1)"
+  [[ -n $add_line && -n $del_line && $add_line -lt $del_line ]] || {
+    printf '        the old permit was removed before the new one was added\n'
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_from_normalizes_non_aligned_cidrs() {
+  # UFW stores 192.168.1.5/32 as 192.168.1.5 and 2a0a:...::5/64 as its network
+  # address. Comparing the typed string with `ufw show added` would delete the
+  # rule that was just added.
+  setup_destdir
+  DRY_RUN=0
+  SSH_FROM=(192.168.1.5/32 2a0a:ef40:b91:d601:0:0:0:5/64)
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  mkdir -p "$CONF_DEST/etc/default"
+  printf 'IPV6=yes\n' >"$CONF_DEST/etc/default/ufw"
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub peek
+  peek() {
+    printf '%s\n' \
+      "ufw limit from 192.168.1.5 to any port 1199 proto tcp comment 'shippi: ssh lan'" \
+      "ufw limit from 2a0a:ef40:b91:d601::5/64 to any port 1199 proto tcp comment 'shippi: ssh lan'"
+  }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_ssh_access 1199
+  local src=$?
+
+  [[ $src -eq 0 ]] || {
+    printf '        configure_ssh_access returned %s, expected success\n' "$src"
+    rc=1
+  }
+  grep -qF 'ufw limit from 192.168.1.5 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw limit from 2a0a:ef40:b91:d601::5/64 to any port 1199 proto tcp' "$log" || rc=1
+  ! grep -qF 'ufw delete limit from 192.168.1.5' "$log" || {
+    printf '        the normalized IPv4 rule was deleted:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  ! grep -qF 'ufw delete limit from 2a0a:ef40:b91:d601::5/64' "$log" || {
+    printf '        the normalized IPv6 rule was deleted:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_from_rejects_world_open_prefix() {
+  setup_destdir
+  DRY_RUN=0
+  local log="$CONF_DEST/run_root.log" rc=0 prefix src
+  : >"$log"
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  for prefix in 0.0.0.0/0 ::/0; do
+    SSH_FROM=("$prefix")
+    configure_ssh_access 1199
+    src=$?
+    [[ $src -eq 1 ]] || {
+      printf '        --ssh-from %s returned %s, expected failure\n' "$prefix" "$src"
+      rc=1
+    }
+  done
+  [[ ! -s $log ]] || {
+    printf '        a world-open prefix reached the firewall:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_dry_run_firewall_survives_unreadable_ufw_show() {
+  # A dry run on a non-root, non-tty host cannot read ufw show added. That is
+  # not a reason to abort the plan: stale scoped permits are unknown, but the
+  # rest of the firewall plan should still print.
+  setup_destdir
+  DRY_RUN=1
+  local rc=0 out frc=0
+  stub current_ssh_port
+  current_ssh_port() { printf '22\n'; }
+  stub listening_ports
+  listening_ports() { printf ''; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub lan_cidrs
+  lan_cidrs() { printf '192.168.1.0/24\n'; }
+  stub have
+  have() { return 0; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub peek
+  peek() { return 1; }
+
+  out="$(configure_firewall 2>&1)"
+  frc=$?
+
+  [[ $frc -eq 0 ]] || {
+    printf '        configure_firewall returned %s, expected success\n' "$frc"
+    rc=1
+  }
+  [[ $out == *'would set: ufw default deny incoming'* ]] || {
+    printf '        the firewall plan was truncated:\n%s\n' "$out"
+    rc=1
+  }
+  [[ $out == *'stale scoped permits are unknown'* ]] || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_access_refuses_a_fresh_host_with_no_permit() {
+  # The lockout case: no LAN detection, no tailnet, no existing SSH rule. The
+  # firewall task must stop before default-deny and ufw enable.
+  setup_destdir
+  DRY_RUN=0
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub current_ssh_port
+  current_ssh_port() { printf '22\n'; }
+  stub listening_ports
+  listening_ports() { printf ''; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub lan_cidrs
+  lan_cidrs() { printf ''; }
+  stub have
+  have() { return 0; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_firewall >/dev/null 2>&1
+  local frc=$?
+
+  [[ $frc -eq 1 ]] || {
+    printf '        configure_firewall returned %s, expected failure\n' "$frc"
+    rc=1
+  }
+  ! grep -qF 'ufw default deny incoming' "$log" || {
+    printf '        default-deny was applied without an SSH permit:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_access_keeps_blanket_when_a_source_fails() {
+  # One failed source means the requested posture is incomplete. Removing the
+  # blanket rule now would drop that source while reporting success.
+  setup_destdir
+  DRY_RUN=0
+  SSH_FROM=(192.168.1.0/24 192.168.2.0/24)
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub run_root
+  run_root() {
+    printf '%s\n' "$*" >>"$log"
+    [[ $* == *'ufw limit from 192.168.2.0/24'* ]] && return 1
+    return 0
+  }
+
+  configure_ssh_access 1199
+  local src=$?
+
+  [[ $src -eq 1 ]] || {
+    printf '        configure_ssh_access returned %s, expected failure\n' "$src"
+    rc=1
+  }
+  grep -qF 'ufw limit from 192.168.1.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  ! grep -qF 'ufw delete allow 1199/tcp' "$log" || {
+    printf '        the blanket allow rule was removed after a source failed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  ! grep -qF 'ufw delete limit 1199/tcp' "$log" || {
+    printf '        the blanket limit rule was removed after a source failed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_is_cidr_rejects_junk() {
+  local rc=0
+  is_cidr 192.168.1.0/24 || rc=1
+  is_cidr 2a0a:ef40:b91:d601::/64 || rc=1
+  ! is_cidr 192.168.1.0 || rc=1
+  ! is_cidr 999.1.1.0/24 || rc=1
+  ! is_cidr 10.0.0.0/33 || rc=1
+  ! is_cidr ::/129 || rc=1
+  ! is_cidr '' || rc=1
   return $rc
 }
 
@@ -3314,7 +3903,7 @@ test_password_quality_dry_run_plans_pam() {
   DRY_RUN=1
   out="$(configure_password_quality 2>&1)"
   DRY_RUN=0
-  [[ $out == *"would write /etc/security/pwquality.conf.d/omapi-hardening.conf"* ]] || {
+  [[ $out == *"would write /etc/security/pwquality.conf.d/shippi-hardening.conf"* ]] || {
     printf '        the quality drop-in was not planned: %s\n' "$out"
     rc=1
   }
@@ -3322,7 +3911,7 @@ test_password_quality_dry_run_plans_pam() {
     printf '        enabling the PAM profile was not planned: %s\n' "$out"
     rc=1
   }
-  [[ ! -e $CONF_DEST/etc/security/pwquality.conf.d/omapi-hardening.conf ]] || {
+  [[ ! -e $CONF_DEST/etc/security/pwquality.conf.d/shippi-hardening.conf ]] || {
     printf '        the dry run wrote the pwquality drop-in\n'
     rc=1
   }
@@ -3333,10 +3922,10 @@ test_password_quality_dry_run_plans_pam() {
 test_password_quality_writes_policy_and_enables_pam() {
   setup_destdir
   mkdir -p "$CONF_DEST/etc"
-  local f="$CONF_DEST/etc/security/pwquality.conf.d/omapi-hardening.conf" rc=0 out pam
+  local f="$CONF_DEST/etc/security/pwquality.conf.d/shippi-hardening.conf" rc=0 out pam
   pam="$(mktemp)"
   printf '# stock common-password\n' >"$pam"
-  export OMAPI_COMMON_PASSWORD="$pam"
+  export SHIPPI_COMMON_PASSWORD="$pam"
   stub have_pwquality
   have_pwquality() { return 0; }
 
@@ -3360,7 +3949,7 @@ test_password_quality_writes_policy_and_enables_pam() {
     printf '        pam-auth-update --enable was not run: %s\n' "$out"
     rc=1
   }
-  unset OMAPI_COMMON_PASSWORD
+  unset SHIPPI_COMMON_PASSWORD
   rm -f "$pam"
   teardown_destdir
   return $rc
@@ -3903,6 +4492,23 @@ t 'audit timeout is inside peek'                        test_audit_timeout_is_in
 
 t 'the firewall loop visits every port'                 test_firewall_loop_visits_every_port
 t 'the firewall loop skips the ssh port'                test_firewall_skips_the_ssh_port
+t 'declining a port closes it'                          test_firewall_no_deletes_an_existing_allow_rule
+t 'lan cidrs come from the default route'               test_lan_cidrs_reads_the_default_route_interface
+t 'a public WAN is not treated as the LAN'              test_lan_cidrs_does_not_open_a_public_wan
+t 'ssh access is scoped, not blanket'                   test_ssh_access_is_scoped_and_removes_the_blanket_rule
+t 'tailnet-only closes the blanket when lan is unknown' test_ssh_access_closes_blanket_when_only_tailnet_is_known
+t '--ssh-from replaces auto-detection'                  test_ssh_from_overrides_lan_detection
+t '--ssh-from is normalized before ufw comparison'      test_ssh_from_normalizes_non_aligned_cidrs
+t '--ssh-from rejects a world-open prefix'              test_ssh_from_rejects_world_open_prefix
+t 'dry-run firewall survives unreadable ufw rules'      test_dry_run_firewall_survives_unreadable_ufw_show
+t 'protocol-less blanket ssh rules are removed'         test_ssh_access_removes_protocolless_blanket_rules
+t 'managed ssh rules are parsed by ownership'           test_ufw_managed_ssh_sources_reads_only_ours
+t 'stale ssh rules are removed, requested kept'         test_remove_stale_managed_ssh_rules_keeps_requested
+t 'tailnet-only removes every managed ssh rule'         test_tailnet_only_removes_all_managed_ssh_rules
+t '--ssh-from removes old scoped permits'               test_ssh_from_replaces_previous_scoped_rules
+t 'no ssh permit blocks firewall policy change'         test_ssh_access_refuses_a_fresh_host_with_no_permit
+t 'a failed ssh source keeps the blanket rule'          test_ssh_access_keeps_blanket_when_a_source_fails
+t 'cidr validation rejects junk'                        test_is_cidr_rejects_junk
 
 t 'docker loopback port is recognised'                  test_docker_port_is_loopback_only
 t 'docker public+loopback is not loopback'             test_docker_port_public_and_loopback_is_not_loopback_only
@@ -3939,6 +4545,7 @@ t 'public addrs not misclassified'       test_public_addresses_are_not_misclassi
 t 'loopback and tailscale still dropped' test_loopback_and_tailscale_ranges_still_dropped
 t 'docker subnets keeps ipv4'            test_docker_subnets_keeps_ipv4
 t 'managed block keeps mode in practice'    test_managed_block_preserves_mode_and_owner_in_practice
+t 'managed block write keeps mode in practice' test_managed_block_write_preserves_mode_and_owner_in_practice
 t 'unreadable target is refused not truncated' test_managed_block_refuses_rather_than_truncating_an_unreadable_target
 t 'block rewrite allowed on empty remainder' test_managed_block_rewrite_allowed_when_remainder_is_empty
 t 'ufw snapshot cleanup uses run_root'       test_ufw_snapshot_cleanup_uses_run_root

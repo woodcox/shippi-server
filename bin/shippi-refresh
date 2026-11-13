@@ -1,0 +1,8 @@
+#!/bin/bash
+set -o pipefail
+
+# Reinstalls Shippi with missing packages and default configs.
+
+if gum confirm "Refresh Shippi (including overwriting configs)?"; then
+  curl -fsSL https://raw.githubusercontent.com/woodcox/shippi-server/main/install.sh | bash
+fi

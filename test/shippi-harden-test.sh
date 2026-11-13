@@ -3368,6 +3368,114 @@ test_ssh_from_replaces_previous_scoped_rules() {
   return $rc
 }
 
+test_ssh_from_normalizes_non_aligned_cidrs() {
+  # UFW stores 192.168.1.5/32 as 192.168.1.5 and 2a0a:...::5/64 as its network
+  # address. Comparing the typed string with `ufw show added` would delete the
+  # rule that was just added.
+  setup_destdir
+  DRY_RUN=0
+  SSH_FROM=(192.168.1.5/32 2a0a:ef40:b91:d601:0:0:0:5/64)
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  mkdir -p "$CONF_DEST/etc/default"
+  printf 'IPV6=yes\n' >"$CONF_DEST/etc/default/ufw"
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub peek
+  peek() {
+    printf '%s\n' \
+      "ufw limit from 192.168.1.5 to any port 1199 proto tcp comment 'shippi: ssh lan'" \
+      "ufw limit from 2a0a:ef40:b91:d601::5/64 to any port 1199 proto tcp comment 'shippi: ssh lan'"
+  }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_ssh_access 1199
+  local src=$?
+
+  [[ $src -eq 0 ]] || {
+    printf '        configure_ssh_access returned %s, expected success\n' "$src"
+    rc=1
+  }
+  grep -qF 'ufw limit from 192.168.1.5 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw limit from 2a0a:ef40:b91:d601::5/64 to any port 1199 proto tcp' "$log" || rc=1
+  ! grep -qF 'ufw delete limit from 192.168.1.5' "$log" || {
+    printf '        the normalized IPv4 rule was deleted:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  ! grep -qF 'ufw delete limit from 2a0a:ef40:b91:d601::5/64' "$log" || {
+    printf '        the normalized IPv6 rule was deleted:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_from_rejects_world_open_prefix() {
+  setup_destdir
+  DRY_RUN=0
+  local log="$CONF_DEST/run_root.log" rc=0 prefix src
+  : >"$log"
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  for prefix in 0.0.0.0/0 ::/0; do
+    SSH_FROM=("$prefix")
+    configure_ssh_access 1199
+    src=$?
+    [[ $src -eq 1 ]] || {
+      printf '        --ssh-from %s returned %s, expected failure\n' "$prefix" "$src"
+      rc=1
+    }
+  done
+  [[ ! -s $log ]] || {
+    printf '        a world-open prefix reached the firewall:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_dry_run_firewall_survives_unreadable_ufw_show() {
+  # A dry run on a non-root, non-tty host cannot read ufw show added. That is
+  # not a reason to abort the plan: stale scoped permits are unknown, but the
+  # rest of the firewall plan should still print.
+  setup_destdir
+  DRY_RUN=1
+  local rc=0 out frc=0
+  stub current_ssh_port
+  current_ssh_port() { printf '22\n'; }
+  stub listening_ports
+  listening_ports() { printf ''; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 1; }
+  stub lan_cidrs
+  lan_cidrs() { printf '192.168.1.0/24\n'; }
+  stub have
+  have() { return 0; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub peek
+  peek() { return 1; }
+
+  out="$(configure_firewall 2>&1)"
+  frc=$?
+
+  [[ $frc -eq 0 ]] || {
+    printf '        configure_firewall returned %s, expected success\n' "$frc"
+    rc=1
+  }
+  [[ $out == *'would set: ufw default deny incoming'* ]] || {
+    printf '        the firewall plan was truncated:\n%s\n' "$out"
+    rc=1
+  }
+  [[ $out == *'stale scoped permits are unknown'* ]] || rc=1
+  teardown_destdir
+  return $rc
+}
+
 test_ssh_access_refuses_a_fresh_host_with_no_permit() {
   # The lockout case: no LAN detection, no tailnet, no existing SSH rule. The
   # firewall task must stop before default-deny and ufw enable.
@@ -4390,6 +4498,9 @@ t 'a public WAN is not treated as the LAN'              test_lan_cidrs_does_not_
 t 'ssh access is scoped, not blanket'                   test_ssh_access_is_scoped_and_removes_the_blanket_rule
 t 'tailnet-only closes the blanket when lan is unknown' test_ssh_access_closes_blanket_when_only_tailnet_is_known
 t '--ssh-from replaces auto-detection'                  test_ssh_from_overrides_lan_detection
+t '--ssh-from is normalized before ufw comparison'      test_ssh_from_normalizes_non_aligned_cidrs
+t '--ssh-from rejects a world-open prefix'              test_ssh_from_rejects_world_open_prefix
+t 'dry-run firewall survives unreadable ufw rules'      test_dry_run_firewall_survives_unreadable_ufw_show
 t 'protocol-less blanket ssh rules are removed'         test_ssh_access_removes_protocolless_blanket_rules
 t 'managed ssh rules are parsed by ownership'           test_ufw_managed_ssh_sources_reads_only_ours
 t 'stale ssh rules are removed, requested kept'         test_remove_stale_managed_ssh_rules_keeps_requested

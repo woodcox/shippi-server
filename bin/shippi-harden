@@ -2586,6 +2586,30 @@ is_cidr() {
   done
 }
 
+# Return the source form UFW actually stores.
+#
+# UFW normalizes a source before writing the rule: IPv4 is reduced to its
+# network address, and /32 or IPv6 /128 is dropped. Comparing the operator's
+# typed value with `ufw show added` would classify the just-added rule as
+# stale and delete it. Use UFW's own normalizer so both sides match; fall back
+# to the typed value when the module is unavailable (for example, a dry run on
+# a host where ufw is not installed).
+ufw_normalize_cidr() {
+  local cidr="$1" normalized
+  normalized="$(python3 - "$cidr" <<'PY'
+import sys
+from ufw.util import normalize_address
+
+cidr = sys.argv[1]
+try:
+    print(normalize_address(cidr, ":" in cidr)[0])
+except Exception:
+    print(cidr)
+PY
+)" || normalized="$cidr"
+  printf '%s\n' "${normalized:-$cidr}"
+}
+
 # Delete a ufw rule, treating "non-existent rule" as success. A genuine
 # failure matters on the SSH path: a blanket permit that survives the run
 # keeps SSH reachable from the internet while the script claims otherwise.
@@ -2645,6 +2669,10 @@ remove_stale_managed_ssh_rules() {
     keep["$cidr"]=1
   done
   if ! existing="$(ufw_managed_ssh_sources "$port")"; then
+    if ((DRY_RUN)); then
+      note "cannot read current ufw rules in dry-run; stale scoped permits are unknown"
+      return 0
+    fi
     warn "could not read ufw's managed SSH rules; stale scoped permits may remain"
     return 1
   fi
@@ -2671,7 +2699,7 @@ remove_stale_managed_ssh_rules() {
 configure_ssh_access() {
   local ssh_port="$1"
   local -a sources=()
-  local cidr kind tailnet_ok=0 applied=0 broad_removed=1 failed=0 stale_failed=0 tailnet_only=0
+  local cidr kind normalized tailnet_ok=0 applied=0 broad_removed=1 failed=0 stale_failed=0 tailnet_only=0
 
   SSH_LAN_APPLIED=()
 
@@ -2682,7 +2710,13 @@ configure_ssh_access() {
         note "not touching the firewall; fix the CIDR and re-run"
         return 1
       fi
-      sources+=("$cidr")
+      normalized="$(ufw_normalize_cidr "$cidr")"
+      if [[ $normalized == */0 ]]; then
+        warn "--ssh-from ${cidr} would allow every address"
+        note "use a narrower source prefix; not touching the firewall"
+        return 1
+      fi
+      sources+=("$normalized")
     done
   else
     while read -r cidr; do

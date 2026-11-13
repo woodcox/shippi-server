@@ -17,8 +17,21 @@ FAIL=0
 # rather than silently running the same test twice and counting it twice.
 _SEEN_TESTS=()
 
+# /tmp is world-writable, and key_strict_modes_ok correctly rejects a key whose
+# parent chain includes it. Keep mktemp output under a private parent so the
+# StrictModes tests check the tree they build rather than /tmp itself.
+TEST_TMP="$(mktemp -d "${HOME}/.shippi-harden-test.XXXXXX")" || {
+  echo "could not create a private temp dir under $HOME" >&2
+  exit 1
+}
+export TMPDIR="$TEST_TMP"
+
 # shellcheck source=../bin/shippi-harden
 source "$SCRIPT"
+
+# The sourced script installs an EXIT trap for its audit temp file. Replace it
+# with one that cleans both that file and this suite's private temp root.
+trap 'rm -rf "$TEST_TMP"; rm -f "$AUDIT_TMP"' EXIT
 
 # Snapshot the script's own functions, so t() can tell when a test has
 # redefined one without registering it. Built once, immediately after the
@@ -40,6 +53,8 @@ setup_destdir() {
   CONF_DEST="$SHIPPI_SECURITY_DESTDIR"
   DRY_RUN=0
   ASSUME_YES=1
+  SSH_FROM=()
+  SSH_LAN_APPLIED=()
   # Stub every privileged call. Without this the tests are not "no root
   # needed" at all: on a machine with passwordless sudo, or a CI runner, the
   # configure_* functions would restart journald, run `sysctl --system`,
@@ -136,6 +151,8 @@ teardown_destdir() {
   CONF_DEST=""
   DRY_RUN=0
   ASSUME_YES=0
+  SSH_FROM=()
+  SSH_LAN_APPLIED=()
 }
 
 # A bash function returns the exit status of its LAST command. Every test that
@@ -644,6 +661,72 @@ test_kernel_audit_is_read_only() {
   [[ $helpers != *apt-get* ]] || rc=1
   [[ $helpers != *'dpkg -i'* ]] || rc=1
   [[ $helpers != *apt\ install* ]] || rc=1
+  return $rc
+}
+
+test_reboot_required_summary() {
+  # The running kernel can be older than the newest installed one even when
+  # /boot is fully package-owned and apt has nothing pending. /var/run/
+  # reboot-required is the only signal, and the .pkgs file names what asked
+  # for it. CONF_DEST keeps this off the live /var/run.
+  setup_destdir
+  local rc=0 out
+  mkdir -p "$CONF_DEST/var/run"
+
+  out="$(reboot_required_summary)"
+  assert_eq "$out" "no" || rc=1
+
+  : >"$CONF_DEST/var/run/reboot-required"
+  out="$(reboot_required_summary)"
+  assert_eq "$out" "yes" || rc=1
+
+  printf 'linux-image-a\nlinux-image-b\nlinux-image-a\n' \
+    >"$CONF_DEST/var/run/reboot-required.pkgs"
+  out="$(reboot_required_summary)"
+  assert_eq "$out" "yes (linux-image-a linux-image-b)" || rc=1
+
+  teardown_destdir
+  return $rc
+}
+
+test_audit_reports_reboot_required() {
+  # The audit is where a user checks whether the kernel they just installed is
+  # the one actually running. A package-owned /boot and "pending updates: 0"
+  # both looked clean while 6.12.115 sat waiting for a reboot.
+  setup_destdir
+  local audit_tmp saved_audit rc=0
+  audit_tmp="$(mktemp)"
+  saved_audit="$AUDIT_TMP"
+  AUDIT_TMP="$audit_tmp"
+  WANT_REPORT=0
+
+  mkdir -p "$CONF_DEST/var/run"
+  : >"$CONF_DEST/var/run/reboot-required"
+  printf 'linux-image-test\n' >"$CONF_DEST/var/run/reboot-required.pkgs"
+
+  stub listening_ports
+  listening_ports() { :; }
+  stub held_back_packages
+  held_back_packages() { :; }
+  stub running_kernel_owner
+  running_kernel_owner() { printf 'linux-image-test\n'; }
+  stub untracked_kernels
+  untracked_kernels() { :; }
+  stub have
+  have() { return 1; }
+  stub peek
+  peek() { return 1; }
+
+  audit >/dev/null 2>&1
+
+  grep -q 'reboot required: yes (linux-image-test)' "$audit_tmp" || {
+    printf '        the audit did not report the pending reboot:\n%s\n' \
+      "$(grep -A2 -B2 'reboot required' "$audit_tmp" || true)"
+    rc=1
+  }
+  AUDIT_TMP="$saved_audit"
+  rm -f "$audit_tmp"
+  teardown_destdir
   return $rc
 }
 
@@ -2570,6 +2653,210 @@ test_firewall_no_deletes_an_existing_allow_rule() {
   return $rc
 }
 
+test_lan_cidrs_reads_the_default_route_interface() {
+  # The LAN is the interface carrying the default route. A hardcoded
+  # 192.168.0.0/16 would either miss the box's real subnet or open every
+  # private network it can route to. Docker and tailscale interfaces are never
+  # LAN sources, and a routed prefix is not the local link.
+  setup_destdir
+  local rc=0 out
+  stub ip
+  ip() {
+    case "$*" in
+      '-4 route show default')
+        printf 'default via 192.168.1.1 dev wlan0 proto dhcp src 192.168.1.118 metric 600\n'
+        ;;
+      '-6 route show default')
+        printf 'default via fe80::1 dev wlan0 proto ra metric 600 pref medium\n'
+        ;;
+      '-4 route show dev wlan0')
+        printf 'default via 192.168.1.1 proto dhcp src 192.168.1.118 metric 600\n'
+        printf '192.168.1.0/24 proto kernel scope link src 192.168.1.118 metric 600\n'
+        ;;
+      '-6 route show dev wlan0')
+        printf '2a0a:ef40:b91:d601::/64 proto ra metric 600 pref medium\n'
+        printf 'fd57:7279:7528::/64 via fe80::1 proto ra metric 600 pref medium\n'
+        printf 'fe80::/64 proto kernel metric 1024 pref medium\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  out="$(lan_cidrs)"
+  [[ $out == *"192.168.1.0/24"* ]] || rc=1
+  [[ $out == *"2a0a:ef40:b91:d601::/64"* ]] || rc=1
+  [[ $out == *"fe80::/64"* ]] || rc=1
+  # A `via` prefix is some other network behind a router, not this link.
+  [[ $out != *"fd57:7279:7528::/64"* ]] || rc=1
+  [[ $out != *"default"* ]] || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_lan_cidrs_does_not_open_a_public_wan() {
+  # On a VPS the default route is a public IPv4 interface. Treating it as the
+  # LAN would recreate the exact public SSH permit this change removes. A
+  # public-IPv4 or IPv6-only LAN can still be described with --ssh-from.
+  setup_destdir
+  local rc=0 out
+  stub ip
+  ip() {
+    case "$*" in
+      '-4 route show default')
+        printf 'default via 203.0.113.1 dev eth0 proto static metric 100\n'
+        ;;
+      '-6 route show default')
+        printf 'default via 2001:db8:1::1 dev eth0 proto static metric 100\n'
+        ;;
+      '-4 route show dev eth0')
+        printf '203.0.113.0/24 proto kernel scope link src 203.0.113.10 metric 100\n'
+        ;;
+      '-6 route show dev eth0')
+        printf '2001:db8:1::/64 proto kernel metric 256 pref medium\n'
+        printf 'fe80::/64 proto kernel metric 256 pref medium\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  out="$(lan_cidrs)"
+  if [[ -n $out ]]; then
+    printf '        a public WAN was treated as the LAN: %s\n' "$out"
+    rc=1
+  fi
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_access_is_scoped_and_removes_the_blanket_rule() {
+  # A bare `ufw limit <port>/tcp` is a public permit. The replacement must add
+  # the LAN and tailnet permits first, then delete the blanket one, so a new
+  # login is never refused in the gap.
+  setup_destdir
+  DRY_RUN=0
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub current_ssh_port
+  current_ssh_port() { printf '1199\n'; }
+  stub listening_ports
+  listening_ports() { printf ''; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
+  stub lan_cidrs
+  lan_cidrs() { printf '192.168.1.0/24\nfd46:fadc:10ef:4115::/64\n'; }
+  stub have
+  have() { return 0; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub docker_published_by
+  docker_published_by() { printf ''; }
+  stub ask
+  ask() { return 1; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  mkdir -p "$CONF_DEST/etc/default"
+  printf 'IPV6=yes\n' >"$CONF_DEST/etc/default/ufw"
+
+  configure_firewall >/dev/null 2>&1
+
+  grep -qF 'ufw limit from 192.168.1.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw limit from fd46:fadc:10ef:4115::/64 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw limit in on tailscale0 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw delete limit 1199/tcp' "$log" || rc=1
+  grep -qF 'ufw delete allow 1199/tcp' "$log" || rc=1
+
+  local add_line del_line
+  add_line="$(grep -nF 'ufw limit from 192.168.1.0/24' "$log" | head -1 | cut -d: -f1)"
+  del_line="$(grep -nF 'ufw delete limit 1199/tcp' "$log" | head -1 | cut -d: -f1)"
+  [[ -n $add_line && -n $del_line && $add_line -lt $del_line ]] || {
+    printf '        the blanket rule was removed before the scoped one was added\n'
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_access_leaves_the_blanket_rule_when_lan_is_unknown() {
+  # If detection fails, the safe outcome is to leave the working SSH path
+  # alone and say so, not to delete the blanket permit and strand the box.
+  setup_destdir
+  DRY_RUN=0
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub current_ssh_port
+  current_ssh_port() { printf '1199\n'; }
+  stub listening_ports
+  listening_ports() { printf ''; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
+  stub lan_cidrs
+  lan_cidrs() { printf ''; }
+  stub have
+  have() { return 0; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub ask
+  ask() { return 1; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_firewall >/dev/null 2>&1
+
+  ! grep -qF 'ufw delete limit 1199/tcp' "$log" || rc=1
+  ! grep -qF 'ufw delete allow 1199/tcp' "$log" || rc=1
+  # But the tailnet permit is still added, so there is a way back in.
+  grep -qF 'ufw limit in on tailscale0 to any port 1199 proto tcp' "$log" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_ssh_from_overrides_lan_detection() {
+  # An explicit --ssh-from is how an operator handles a multi-homed box or a
+  # LAN the default route does not describe. It must replace, not add to,
+  # the auto-detected prefixes.
+  setup_destdir
+  DRY_RUN=0
+  SSH_FROM=(192.168.50.0/24)
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub current_ssh_port
+  current_ssh_port() { printf '1199\n'; }
+  stub listening_ports
+  listening_ports() { printf ''; }
+  stub tailscale_interface_present
+  tailscale_interface_present() { return 0; }
+  stub lan_cidrs
+  lan_cidrs() { printf '10.0.0.0/8\n'; }
+  stub have
+  have() { return 0; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub ask
+  ask() { return 1; }
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_firewall >/dev/null 2>&1
+
+  grep -qF 'ufw limit from 192.168.50.0/24 to any port 1199 proto tcp' "$log" || rc=1
+  ! grep -qF 'ufw limit from 10.0.0.0/8' "$log" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_is_cidr_rejects_junk() {
+  local rc=0
+  is_cidr 192.168.1.0/24 || rc=1
+  is_cidr 2a0a:ef40:b91:d601::/64 || rc=1
+  ! is_cidr 192.168.1.0 || rc=1
+  ! is_cidr 999.1.1.0/24 || rc=1
+  ! is_cidr 10.0.0.0/33 || rc=1
+  ! is_cidr ::/129 || rc=1
+  ! is_cidr '' || rc=1
+  return $rc
+}
+
 test_docker_port_is_loopback_only() {
   # The loopback binding is expressed in the HOST port (`-p 127.0.0.1:8080:80`)
   # while the question is about the CONTAINER port. Matching one against the
@@ -2892,6 +3179,12 @@ t 'audit timeout is inside peek'                        test_audit_timeout_is_in
 t 'the firewall loop visits every port'                 test_firewall_loop_visits_every_port
 t 'the firewall loop skips the ssh port'                test_firewall_skips_the_ssh_port
 t 'declining a port closes it'                          test_firewall_no_deletes_an_existing_allow_rule
+t 'lan cidrs come from the default route'               test_lan_cidrs_reads_the_default_route_interface
+t 'a public WAN is not treated as the LAN'              test_lan_cidrs_does_not_open_a_public_wan
+t 'ssh access is scoped, not blanket'                   test_ssh_access_is_scoped_and_removes_the_blanket_rule
+t 'unknown lan leaves the ssh rules alone'              test_ssh_access_leaves_the_blanket_rule_when_lan_is_unknown
+t '--ssh-from replaces auto-detection'                  test_ssh_from_overrides_lan_detection
+t 'cidr validation rejects junk'                        test_is_cidr_rejects_junk
 
 t 'docker loopback port is recognised'                  test_docker_port_is_loopback_only
 t 'docker public+loopback is not loopback'             test_docker_port_public_and_loopback_is_not_loopback_only
@@ -2972,6 +3265,8 @@ t 'an untracked kernel image is detected'               test_untracked_kernels_f
 t 'initrd/cmdline are not false positives'              test_untracked_kernels_ignores_files_that_are_untracked_by_design
 t 'running kernel owner resolves on this box'           test_running_kernel_owner_reads_the_real_boot_dir
 t 'the kernel audit check changes nothing'              test_kernel_audit_is_read_only
+t 'reboot-required is summarised'                       test_reboot_required_summary
+t 'audit reports a pending reboot'                      test_audit_reports_reboot_required
 t 'fail2ban jail parses as INI'                         test_fail2ban_jail_parses_as_ini
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAIL"

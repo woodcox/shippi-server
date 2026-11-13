@@ -48,6 +48,11 @@ NO_RESTART=0
 # throwaway tree instead of the live system. Unset in normal use.
 CONF_DEST="${SHIPPI_SECURITY_DESTDIR:-}"
 SELECTED=()
+# --ssh-from values. Repeatable. Empty means "use the detected LAN prefixes".
+SSH_FROM=()
+# LAN prefixes successfully applied by configure_ssh_access. Consumed by the
+# optional "tailnet only" prompt in configure_firewall.
+SSH_LAN_APPLIED=()
 
 # Prepended, not appended: sshd honours the FIRST value it reads, so a
 # matching directive further down sshd_config - or in an Include drop-in
@@ -101,7 +106,8 @@ Tasks (default: all but aide):
   packages    install the hardening tooling (ufw, fail2ban, apparmor, ...)
   users       no empty passwords, lock the default `pi` account, audit UID 0
   ssh         sshd hardening: no root login, no passwords, key-only, limits
-  firewall    ufw: deny incoming by default, allow only what is listening
+  firewall    ufw: deny incoming by default, allow only what is listening;
+              SSH is limited to the LAN and tailscale0, not the whole internet
   fail2ban    ban repeat SSH/auth failures, banaction matched to ufw
   updates     unattended-upgrades for security patches, no surprise reboots
   apparmor    enable AppArmor and report complain counts
@@ -113,6 +119,10 @@ Options:
   -y, --yes         accept recommended defaults, do not prompt
   -n, --dry-run     print the plan, run only read-only commands
       --lockdown-ssh additionally set `AllowUsers <you>` in sshd_config
+      --ssh-from CIDR restrict SSH to this source prefix (repeatable).
+                      Default: the LAN subnets on the default-route interface,
+                      plus tailscale0; by default SSH is never opened to
+                      0.0.0.0/0.
       --report       also save the audit report to ~/security-audit/
       --no-audit     skip the final report
       --no-restart   write configs but do not restart any service
@@ -1944,6 +1954,249 @@ docker_published_by() {
     }'
 }
 
+# ---------------------------------------------------------------------------
+# SSH exposure
+# ---------------------------------------------------------------------------
+# The interface carrying the default route is the LAN side. Its connected
+# prefixes are what a `.local` client can legitimately come from: avahi
+# advertises the IPv4 subnet and the IPv6 prefixes on that same interface, so
+# limiting SSH to them keeps mDNS-name logins working without opening the
+# port to the world.
+#
+# Deliberately never falls back to 0.0.0.0/0. If this cannot work out the
+# LAN, configure_ssh_access leaves the existing SSH rules alone and says to
+# pass --ssh-from. "Cannot detect" must not become "open to everyone", and it
+# must not become "nobody" either.
+lan_cidrs() {
+  local -a ifaces=()
+  local iface
+  while read -r iface; do
+    [[ -n $iface ]] || continue
+    case $iface in
+      lo | tailscale* | docker* | br-* | veth*) continue ;;
+    esac
+    ifaces+=("$iface")
+  done < <(
+    {
+      ip -4 route show default 2>/dev/null
+      ip -6 route show default 2>/dev/null
+    } | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); next }}' | sort -u
+  )
+
+  # No default route: an isolated LAN still has on-link prefixes, and SSH
+  # should not stay world-reachable just because there is no gateway.
+  if ((${#ifaces[@]} == 0)); then
+    while read -r iface; do
+      [[ -n $iface ]] || continue
+      case $iface in
+        lo | tailscale* | docker* | br-* | veth*) continue ;;
+      esac
+      ifaces+=("$iface")
+    done < <(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1)
+  fi
+
+  local v4 has_private p
+  for iface in "${ifaces[@]}"; do
+    v4="$(ip -4 route show dev "$iface" 2>/dev/null |
+      awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ && $0 !~ / via / {print $1}')"
+    has_private=0
+    while read -r p; do
+      [[ -n $p ]] || continue
+      case $p in
+        10.[0-9]* | 192.168.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].*) has_private=1 ;;
+      esac
+    done <<<"$v4"
+
+    # A public IPv4 prefix is a WAN address, not a LAN. Do not turn the
+    # default route into a public permit on a VPS. Skipping the whole
+    # interface also keeps its public IPv6 /64 out; an IPv6-only or
+    # public-IPv4 LAN can still be described with --ssh-from.
+    if ((!has_private)); then
+      continue
+    fi
+
+    # On-link IPv4 prefix, not the whole RFC1918 space: this box may sit on a
+    # 10.x network whose other subnets are not local. A `via` route is some
+    # other network reachable through a router, not this link.
+    printf '%s\n' "$v4" |
+      awk '$1 ~ /^10\./ || $1 ~ /^192\.168\./ ||
+           $1 ~ /^172\.(1[6-9]|2[0-9]|3[01])\./ {print $1}'
+    # On-link IPv6 prefixes. This is what avahi advertises for the interface:
+    # the public SLAAC /64 and fe80::/64, not a delegated prefix routed in from
+    # somewhere else. fe80::/64 is included because a client can reach the
+    # Pi's link-local address, and excluding it would make a working `.local`
+    # login fail. Multicast routes are never a source.
+    ip -6 route show dev "$iface" 2>/dev/null |
+      awk '$1 ~ /^[0-9A-Fa-f:]+\/[0-9]+$/ && $1 !~ /^ff00::\/8$/ && $0 !~ / via / {print $1}'
+  done | sort -u
+}
+
+tailscale_interface_present() {
+  [[ -d /sys/class/net/tailscale0 ]] || (peek tailscale status &>/dev/null)
+}
+
+ufw_ipv6_enabled() {
+  grep -qE '^IPV6=yes' "${CONF_DEST}/etc/default/ufw" 2>/dev/null
+}
+
+# A source prefix the caller asked for. Shape check only; ufw is the final
+# validator, but a typo should not reach it as an empty or flag-like argument.
+is_cidr() {
+  local cidr="$1" addr prefix o
+  local -a octets
+  [[ $cidr == */* ]] || return 1
+  addr="${cidr%/*}"
+  prefix="${cidr##*/}"
+  [[ $prefix =~ ^[0-9]{1,3}$ ]] || return 1
+  if [[ $addr == *:* ]]; then
+    ((prefix <= 128)) || return 1
+    [[ $addr =~ ^[0-9A-Fa-f:]+$ ]]
+    return
+  fi
+  ((prefix <= 32)) || return 1
+  [[ $addr =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -r -a octets <<<"$addr"
+  for o in "${octets[@]}"; do
+    ((10#$o >= 0 && 10#$o <= 255)) || return 1
+  done
+}
+
+# Delete a ufw rule, treating "non-existent rule" as success. A genuine
+# failure matters on the SSH path: a blanket permit that survives the run
+# keeps SSH reachable from the internet while the script claims otherwise.
+ufw_delete_rule() {
+  if ((DRY_RUN)); then
+    printf '  %s•%s would run: ufw delete %s\n' "$C_DIM" "$C_OFF" "$*"
+    return 0
+  fi
+  local out
+  if out="$(run_root ufw delete "$@" 2>&1)"; then
+    return 0
+  fi
+  if [[ $out == *"non-existent rule"* ]]; then
+    return 0
+  fi
+  warn "could not delete ufw rule '$*': ${out:-command failed}"
+  return 1
+}
+
+# Install the SSH permits. The old script wrote one blanket
+# `ufw limit <port>/tcp`, which is a public permit. This writes:
+#   * one rate-limited permit per LAN prefix, so `.local` SSH from the same
+#     link keeps working over both IPv4 and IPv6;
+#   * one permit on tailscale0, so the tailnet is always a way back in.
+# Only then is the blanket rule removed. The order matters: on an already
+# active firewall, deleting the broad rule before the scoped ones exist
+# leaves a window in which a new login is refused.
+configure_ssh_access() {
+  local ssh_port="$1"
+  local -a sources=()
+  local cidr kind tailnet_ok=0 applied=0 broad_removed=1
+
+  SSH_LAN_APPLIED=()
+
+  if ((${#SSH_FROM[@]})); then
+    for cidr in "${SSH_FROM[@]}"; do
+      if ! is_cidr "$cidr"; then
+        warn "ignoring invalid --ssh-from value: ${cidr}"
+        continue
+      fi
+      sources+=("$cidr")
+    done
+  else
+    while read -r cidr; do
+      [[ -n $cidr ]] || continue
+      sources+=("$cidr")
+    done < <(lan_cidrs)
+  fi
+
+  # A previous Tailscale-only run wrote a blanket deny. ufw evaluates rules
+  # in order, so a deny left above the new permits would shadow all of them.
+  # Unlike the old broad allow/limit delete below, failure here is a reason to
+  # stop: adding permits that a surviving deny shadows would report success
+  # while SSH stayed closed.
+  if ! ufw_delete_rule deny "$ssh_port/tcp"; then
+    warn "could not remove the existing deny rule for ${ssh_port}/tcp; leaving SSH rules alone"
+    note "remove it manually: sudo ufw delete deny ${ssh_port}/tcp"
+    return 1
+  fi
+
+  # Tailnet first. This is independent of the blanket tailscale0 allow in
+  # configure_firewall: even if the caller declines that, SSH itself should
+  # stay reachable over the tailnet, which is the least likely path to be the
+  # current session.
+  if tailscale_interface_present; then
+    if ((DRY_RUN)); then
+      printf '  %s•%s would allow: ufw limit in on tailscale0 to any port %s proto tcp\n' \
+        "$C_DIM" "$C_OFF" "$ssh_port"
+      tailnet_ok=1
+    elif run_root ufw limit in on tailscale0 to any port "$ssh_port" proto tcp \
+      comment "shippi: ssh tailnet"; then
+      tailnet_ok=1
+      ok "ssh reachable over tailscale0"
+    else
+      warn "could not allow ssh on tailscale0"
+    fi
+  fi
+
+  if ((${#sources[@]} == 0)); then
+    warn "cannot determine the LAN subnet for SSH; leaving the existing SSH rules unchanged"
+    note "pass --ssh-from <cidr> (repeatable) to restrict SSH to a known source range"
+    return 0
+  fi
+
+  for cidr in "${sources[@]}"; do
+    # ufw refuses IPv6 rules when its own IPv6 support is off. Skipping them
+    # here is better than aborting the whole firewall task on a v4-only box.
+    if [[ $cidr == *:* ]] && ! ufw_ipv6_enabled; then
+      note "skipping IPv6 SSH source ${cidr}: ufw has IPv6 disabled"
+      continue
+    fi
+    if ((DRY_RUN)); then
+      printf '  %s•%s would allow: ufw limit from %s to any port %s proto tcp\n' \
+        "$C_DIM" "$C_OFF" "$cidr" "$ssh_port"
+      SSH_LAN_APPLIED+=("$cidr")
+      applied=1
+      continue
+    fi
+    if run_root ufw limit from "$cidr" to any port "$ssh_port" proto tcp \
+      comment "shippi: ssh lan"; then
+      SSH_LAN_APPLIED+=("$cidr")
+      applied=1
+    else
+      warn "could not restrict ssh to ${cidr}"
+    fi
+  done
+
+  if ((applied == 0)); then
+    warn "no scoped SSH rule could be applied; leaving the existing SSH rules unchanged"
+    return 0
+  fi
+
+  # Only now remove the blanket permit. This is the step that actually closes
+  # the public port on a box hardened by an earlier version. If a delete
+  # fails, say so: a stale permit means SSH is still world-reachable.
+  for kind in allow limit; do
+    if ! ufw_delete_rule "$kind" "$ssh_port/tcp"; then
+      broad_removed=0
+    fi
+  done
+
+  local scope="${SSH_LAN_APPLIED[*]}"
+  if ((tailnet_ok)); then
+    scope="${scope} and tailscale0"
+  fi
+  if ((!broad_removed)); then
+    warn "an old blanket SSH rule is still present; SSH remains reachable from the internet"
+    note "remove it with: sudo ufw delete allow ${ssh_port}/tcp && sudo ufw delete limit ${ssh_port}/tcp"
+  elif ((DRY_RUN)); then
+    note "would limit SSH to ${scope}"
+  else
+    ok "ssh limited to ${scope}"
+    note "existing sessions stay up; verify a new login from each allowed source before closing this one"
+  fi
+}
+
 configure_firewall() {
   section "Firewall (ufw)"
 
@@ -1956,12 +2209,12 @@ configure_firewall() {
   # returns before the first `ufw` command runs. This guard used to sit after
   # `ufw default deny incoming`, so on a box where ufw was already active the
   # script flipped the incoming policy to deny and then bailed out - never
-  # adding the `ufw limit` rule for the SSH port. If that box relied on the
-  # broad allow policy, every new SSH connection was blocked while the script
-  # reported "not touching the firewall".
+  # adding the permits for the SSH port. If that box relied on the broad allow
+  # policy, every new SSH connection was blocked while the script reported
+  # "not touching the firewall".
   local ssh_port
   ssh_port="$(current_ssh_port || true)"
-  # Stop rather than guess. A `ufw limit /tcp` with an empty port is silently
+  # Stop rather than guess. An SSH rule with an empty port is silently
   # malformed, and carrying on to default-deny would close the port the user is
   # connected on. This is the one place in the script where not knowing the
   # answer must mean doing nothing.
@@ -1973,18 +2226,13 @@ configure_firewall() {
   fi
 
   # Allow BEFORE deny, not after. ufw evaluates rules in order, and a
-  # `default deny` that lands before the SSH rule leaves a window in which
+  # `default deny` that lands before the SSH permits leaves a window in which
   # new inbound connections are denied with nothing to permit them. On a box
   # where ufw is ALREADY active that is a real reconnect lockout: the current
   # session survives on ufw's ESTABLISHED rule, so it looks fine, and the next
-  # login is refused. Adding the permit first means the deny can never be the
+  # login is refused. Adding the permits first means the deny can never be the
   # last thing standing between an arriving connection and a closed door.
-  if ((DRY_RUN)); then
-    printf '  %s•%s would allow: ufw limit %s/tcp\n' "$C_DIM" "$C_OFF" "$ssh_port"
-  else
-    run_root ufw limit "$ssh_port/tcp"
-    ok "ssh rate-limited on port ${ssh_port}"
-  fi
+  configure_ssh_access "$ssh_port"
 
   if ((DRY_RUN)); then
     note "would set: ufw default deny incoming / allow outgoing, logging on"
@@ -1998,7 +2246,7 @@ configure_firewall() {
   # Tailscale's interface is not a public interface, but ufw still counts
   # packets arriving on it, and losing the tailnet would lose the way back in.
   local tailscale_allowed=0
-  if [[ -d /sys/class/net/tailscale0 ]] || (peek tailscale status &>/dev/null); then
+  if tailscale_interface_present; then
     if ((DRY_RUN)); then
       printf '  %s•%s would allow: ufw allow in on tailscale0\n' "$C_DIM" "$C_OFF"
     elif ask "allow traffic arriving on the tailscale0 interface?" y; then
@@ -2077,29 +2325,22 @@ configure_firewall() {
     note "published port. Fixing that now with the DOCKER-USER chain."
   fi
 
-  # If the tailnet is the only way in, port 22 can go away entirely. This is
-  # the network-level half of the VPN advice in the guides, and it is the one
-  # step that can end a session, so it is opt-in and loud.
-  # Gated on the tailnet actually being allowed. Declining the interface prompt
-  # above leaves tailnet traffic under `default deny incoming`, so allowing a
-  # "Tailscale SSH only" close here would delete the SSH rule and add a deny
-  # while leaving no route back in at all - the next login is refused on the
-  # WAN and on the tailnet. Refuse rather than offer it.
-  if ((tailscale_allowed)) && [[ -d /sys/class/net/tailscale0 ]] &&
-     ask "close port ${ssh_port} completely (Tailscale SSH only)?" n; then
-    if ((DRY_RUN)); then
-      printf '  %s•%s would deny: ufw deny %s/tcp\n' "$C_DIM" "$C_OFF" "$ssh_port"
-    else
-      # `delete limit`, not `delete allow`: the rule added above is a
-      # `ufw limit` one, so `delete allow` matches nothing and leaves it in
-      # place. The `|| true` hid that, and a stale limit rule reappears the
-      # moment the deny is ever removed. Delete both forms so a box that
-      # predates this script is handled too.
-      run_root ufw delete limit "$ssh_port/tcp" || true
-      run_root ufw delete allow "$ssh_port/tcp" || true
-      run_root ufw deny "$ssh_port/tcp" comment "shippi: ssh over tailscale only"
-      warn "port ${ssh_port} is now denied - make sure a tailscale session works"
-    fi
+  # The scoped permits above already keep SSH off the public internet. This
+  # optional step removes the LAN permits too, leaving only tailscale0. It is
+  # gated on the blanket tailnet allow: declining that leaves tailnet traffic
+  # under default deny, so a "tailnet only" close would delete the last way in.
+  if ((tailscale_allowed)) && tailscale_interface_present &&
+     ((${#SSH_LAN_APPLIED[@]} > 0)) &&
+     ask "close the LAN SSH rules as well (tailnet remains)?" n; then
+    local cidr
+    for cidr in "${SSH_LAN_APPLIED[@]}"; do
+      ufw_delete_rule limit from "$cidr" to any port "$ssh_port" proto tcp || true
+    done
+    # A previous run may have left a blanket permit; remove it too.
+    ufw_delete_rule allow "$ssh_port/tcp" || true
+    ufw_delete_rule limit "$ssh_port/tcp" || true
+    ok "ssh is now reachable over tailscale0 only"
+    warn "LAN logins to ${ssh_port} will be refused - make sure a tailscale session works"
   fi
 
   configure_docker_ufw
@@ -2570,6 +2811,31 @@ running_kernel_owner() {
   local rel="${1:-$(uname -r)}" img="/boot/vmlinuz-${1:-$(uname -r)}"
   [[ -f $img || -L $img ]] || return 1
   dpkg -S "$img" 2>/dev/null | cut -d: -f1
+}
+
+# Debian's maintainer scripts drop /var/run/reboot-required when a running
+# kernel, library or service needs the new boot. The kernel-ownership check
+# below cannot see this: a box that installed 6.12.115 but is still running
+# 6.12.109 has every /boot image owned by a package and no pending updates, so
+# it reads as fully patched until the next manual reboot. Report the flag and
+# the packages that asked for it, read-only. CONF_DEST keeps the tests off the
+# live /var/run tree.
+reboot_required_summary() {
+  local flag="${CONF_DEST}/var/run/reboot-required"
+  local pkgs="${CONF_DEST}/var/run/reboot-required.pkgs"
+  local list=""
+  [[ -e $flag ]] || {
+    printf 'no\n'
+    return 0
+  }
+  if [[ -r $pkgs ]]; then
+    list="$(awk 'NF && !seen[$0]++ {printf "%s%s", sep, $0; sep=" "}' "$pkgs" 2>/dev/null || true)"
+  fi
+  if [[ -n $list ]]; then
+    printf 'yes (%s)\n' "$list"
+  else
+    printf 'yes\n'
+  fi
 }
 
 # Package names apt is holding back, one per line, or nothing on stdout.
@@ -3044,6 +3310,7 @@ audit() {
     else
       printf '  every kernel image in /boot is owned by a package\n'
     fi
+    printf '  reboot required: %s\n' "$(reboot_required_summary)"
     printf '\n-- apparmor --\n'
     peek aa-status 2>/dev/null | head -6 | sed 's/^/  /' || printf '  not installed\n'
 
@@ -3152,6 +3419,15 @@ main() {
       -y | --yes) ASSUME_YES=1 ;;
       -n | --dry-run) DRY_RUN=1 ;;
       --lockdown-ssh) LOCKDOWN_SSH=1 ;;
+      --ssh-from)
+        if (($# < 2)) || [[ -z ${2:-} || ${2:0:1} == - ]]; then
+          printf 'error: --ssh-from needs a CIDR\n\n' >&2
+          usage >&2
+          return 2
+        fi
+        SSH_FROM+=("$2")
+        shift
+        ;;
       --report) WANT_REPORT=1 ;;
       --no-audit) RUN_AUDIT=0 ;;
       --no-restart) NO_RESTART=1 ;;

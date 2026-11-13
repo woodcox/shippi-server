@@ -141,6 +141,7 @@ root to read `/etc/ufw/after.rules` (`0640 root:root`); without it the
 sudo $HOME/.local/bin/shippi-harden --list       # available tasks
 sudo $HOME/.local/bin/shippi-harden ssh firewall  # just these two
 sudo $HOME/.local/bin/shippi-harden --yes         # take the recommended defaults
+sudo $HOME/.local/bin/shippi-harden --ssh-from 192.168.1.0/24 firewall
 ./test/shippi-harden-test.sh              # test suite does not need root access
 ```
 
@@ -158,6 +159,16 @@ Some deliberate choices worth knowing before you run it:
   With no usable key it stops and asks — and that question defaults to *no*, so
   neither `--yes` nor `--force` can talk its way past it. Every config is
   validated before its service restarts, and rolled back if it fails.
+- **SSH is not exposed to the world.** The firewall task rate-limits SSH from
+  the LAN prefixes on the interface carrying the default route, and allows it
+  on `tailscale0`; it removes the blanket `ufw limit <port>/tcp` rule written by
+  earlier versions. `.local` names keep working because UFW's stock
+  `before.rules` already permits mDNS on 5353, and the LAN rule covers the
+  private IPv4 subnet and the on-link IPv6 prefixes avahi advertises. If the LAN
+  is not the default-route interface (multi-homed, VLANs), pass
+  `--ssh-from <cidr>` one or more times to replace the detected prefixes.
+  Existing sessions stay up, but verify a new login from each allowed source
+  before closing the old one.
 - **Prompts use `gum`**, reading `/dev/tty` directly, so they still appear when
   the script is iterating over ports or accounts. Without a terminal at all it
   says so and takes the documented default rather than silently guessing.
@@ -198,7 +209,9 @@ Some deliberate choices worth knowing before you run it:
   apt's management so it quietly stops receiving patches. That check is scoped
   to kernel images: a Pi's `initrd.img-*`, `cmdline.txt` and `overlays` are
   untracked by design, and a check that fires on every machine is one nobody
-  reads.
+  reads. The audit also reports `/var/run/reboot-required` and the packages
+  that set it, because a package-owned `/boot` with zero pending updates still
+  looks clean while a just-installed kernel waits for a reboot.
 - **`net.ipv4.ip_forward` is left alone** when the Docker service is *running*,
   since the container bridge needs it. If Docker is installed but stopped when
   you run the script, forwarding is turned off; start Docker and re-run if that

@@ -1666,6 +1666,108 @@ test_listening_process_survives_missing_ss() {
   return $rc
 }
 
+test_listening_process_retries_ss_with_privilege() {
+  # `ss -p` hides sockets owned by other users. The helper used to notice the
+  # empty pid, check `sudo -n true`, and then never run ss under sudo - so a
+  # root-owned listener (dockerd on 2377, sshd, tailscaled) came back "unknown"
+  # and the firewall prompt said "needs root to see the owner" while a ticket
+  # was sitting there unused. Retry through peek, which uses the cached
+  # credential or asks on /dev/tty.
+  setup_destdir
+  local rc=0
+  local marker="$TEST_TMP/listening-process-peek-calls"
+  : >"$marker"
+  stub have
+  have() { [[ $1 == ss ]] && return 0; return 1; }
+  stub id
+  id() { if [[ $1 == -u ]]; then echo 1000; else command id "$@"; fi; }
+  # Unprivileged ss sees the socket but no pid; only the privileged call does.
+  stub ss
+  ss() { printf 'tcp LISTEN 0 4096 *:2377 *:*\n'; }
+  stub peek
+  peek() {
+    printf '%s\n' "$1" >>"$marker"
+    case $1 in
+      ss) printf 'tcp LISTEN 0 4096 *:2377 *:* users:(("dockerd",pid=1044,fd=49))\n' ;;
+      ps) printf 'dockerd\n' ;;
+    esac
+    return 0
+  }
+  local out
+  out="$(listening_process tcp 2377)"
+  if [[ $out != dockerd ]]; then
+    printf '        got [%s], wanted dockerd\n' "$out"
+    rc=1
+  fi
+  if ! grep -qx ss "$marker"; then
+    printf '        ss was not retried through peek (calls: %s)\n' "$(tr '\n' ' ' <"$marker")"
+    rc=1
+  fi
+  teardown_destdir
+  return $rc
+}
+
+test_listening_process_reports_need_root_without_privilege() {
+  # When there is no cached ticket and no tty to ask on, the prompt must still
+  # say it could not see the owner rather than claiming "unknown" or "false".
+  setup_destdir
+  local rc=0
+  stub have
+  have() { [[ $1 == ss ]] && return 0; return 1; }
+  stub id
+  id() { if [[ $1 == -u ]]; then echo 1000; else command id "$@"; fi; }
+  stub ss
+  ss() { printf 'tcp LISTEN 0 4096 *:2377 *:*\n'; }
+  stub peek
+  peek() { return 1; }
+  stub sudo
+  sudo() { return 1; }
+  local out
+  out="$(listening_process tcp 2377 2>/dev/null)"
+  if [[ $out != "need root" ]]; then
+    printf '        got [%s], wanted "need root"\n' "$out"
+    rc=1
+  fi
+  teardown_destdir
+  return $rc
+}
+
+test_listening_process_skips_privilege_when_pid_is_visible() {
+  # A process the caller owns is already visible to the unprivileged ss. Do not
+  # retry it through peek: that would ask for a password (or warn) for a socket
+  # that was never hidden.
+  setup_destdir
+  local rc=0
+  local marker="$TEST_TMP/listening-process-visible-calls"
+  : >"$marker"
+  stub have
+  have() { [[ $1 == ss ]] && return 0; return 1; }
+  stub id
+  id() { if [[ $1 == -u ]]; then echo 1000; else command id "$@"; fi; }
+  stub ss
+  ss() { printf 'tcp LISTEN 0 4096 *:3000 *:* users:(("node",pid=991,fd=21))\n'; }
+  stub peek
+  peek() {
+    printf '%s\n' "$1" >>"$marker"
+    case $1 in
+      ps) printf 'node\n' ;;
+    esac
+    return 0
+  }
+  local out
+  out="$(listening_process tcp 3000)"
+  if [[ $out != node ]]; then
+    printf '        got [%s], wanted node\n' "$out"
+    rc=1
+  fi
+  if grep -qx ss "$marker"; then
+    printf '        retried visible ss through peek\n'
+    rc=1
+  fi
+  teardown_destdir
+  return $rc
+}
+
 test_ipv4_ruleset_rejects_ipv6_subnets() {
   # after.rules is the IPv4 ruleset, but docker_subnets returns both families
   # (now that the IPv4 filter bug is fixed). An IPv6 subnet written there
@@ -4623,6 +4725,9 @@ t 'sudo asks on a tty despite piped stdin' test_priv_asks_on_tty_even_with_piped
 t 'peek asks on a tty despite piped stdin' test_peek_asks_on_tty_even_with_piped_stdin
 t 'sudo warm-up is not gated on stdin'   test_sudo_prompt_is_not_gated_on_stdin
 t 'listening process survives missing ss'  test_listening_process_survives_missing_ss
+t 'listening process retries ss with privilege' test_listening_process_retries_ss_with_privilege
+t 'listening process reports need root'   test_listening_process_reports_need_root_without_privilege
+t 'listening process skips needless retry' test_listening_process_skips_privilege_when_pid_is_visible
 t 'ipv4 ruleset rejects ipv6 subnets'     test_ipv4_ruleset_rejects_ipv6_subnets
 t 'validator requires both markers'       test_validator_requires_both_markers
 t 'apparmor does not claim unverified ok' test_apparmor_does_not_claim_success_it_cannot_confirm

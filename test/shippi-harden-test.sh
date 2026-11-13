@@ -1999,6 +1999,91 @@ test_harden_ssh_survives_an_unopenable_tty() {
   return $rc
 }
 
+test_priv_asks_on_tty_even_with_piped_stdin() {
+  # sudo reads its password from /dev/tty, not stdin. Gating the prompt on
+  # `[[ -t 0 ]]` therefore turned "ask for the password" into "refuse and skip
+  # the privileged step" under a pipe: `curl ... | bash`, an agent runner, or
+  # `ssh host shippi-harden` without -t. install.sh never had that problem
+  # because it just calls sudo. Assert the behaviour: stdin is /dev/null, a
+  # tty is available, so priv must ask sudo rather than give up.
+  if [[ $(id -u) -eq 0 ]]; then
+    return 0
+  fi
+  local rc=0
+  local marker="$TEST_TMP/priv-sudo-called"
+  rm -f "$marker"
+  stub sudo
+  sudo() {
+    if [[ $1 == -n ]]; then return 1; fi
+    printf '%s\n' "$*" >"$marker"
+    return 0
+  }
+  stub have_tty
+  have_tty() { return 0; }
+  if ! priv true </dev/null; then
+    printf '        priv refused even though a tty was available\n'
+    rc=1
+  fi
+  if [[ ! -s $marker ]]; then
+    printf '        priv never reached an interactive sudo\n'
+    rc=1
+  fi
+  rm -f "$marker"
+  teardown_destdir
+  return $rc
+}
+
+test_peek_asks_on_tty_even_with_piped_stdin() {
+  # Same defect as priv, in the read-only path: under --dry-run with no cached
+  # credential, peek is the first thing that needs root, so refusing there
+  # skips the reads the plan is built from.
+  if [[ $(id -u) -eq 0 ]]; then
+    return 0
+  fi
+  local rc=0
+  local marker="$TEST_TMP/peek-sudo-called"
+  rm -f "$marker"
+  stub sudo
+  sudo() {
+    if [[ $1 == -n ]]; then return 1; fi
+    printf '%s\n' "$*" >"$marker"
+    return 0
+  }
+  stub have_tty
+  have_tty() { return 0; }
+  if ! peek true </dev/null; then
+    printf '        peek skipped a privileged read despite an available tty\n'
+    rc=1
+  fi
+  if [[ ! -s $marker ]]; then
+    printf '        peek never reached an interactive sudo\n'
+    rc=1
+  fi
+  rm -f "$marker"
+  teardown_destdir
+  return $rc
+}
+
+test_sudo_prompt_is_not_gated_on_stdin() {
+  # A source-level guard for the third place that used `[[ -t 0 ]]`: the
+  # one-time warm-up in main. It is not callable from the suite (main runs the
+  # selected tasks), so assert the code itself asks through have_tty. The
+  # comments still mention the old test deliberately; only real code counts.
+  setup_destdir
+  local rc=0
+  local f; f="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/shippi-harden"
+  if grep -qE '^[[:space:]]*(if|elif) \[\[ -t 0 \]\]' "$f"; then
+    printf '        a sudo prompt is still gated on stdin being a tty\n'
+    rc=1
+  fi
+  if ! grep -q 'have_tty() { (: </dev/tty) 2>/dev/null; }' "$f"; then
+    printf '        have_tty does not open /dev/tty to prove it is usable\n'
+    rc=1
+  fi
+  teardown_destdir
+  return $rc
+}
+
 test_mode_is_applied_before_the_rename_not_after() {
   # The end state is the same either way - a post-rename chmod leaves the file
   # at the right mode - so a final-value assertion cannot see this. The defect
@@ -4534,6 +4619,9 @@ t 'SSH writes and rollback use privilege' test_harden_ssh_privileged_transaction
 t 'harden_ssh write preserves mode'       test_harden_ssh_write_preserves_mode
 t 'mode applied before the rename'     test_mode_is_applied_before_the_rename_not_after
 t 'harden_ssh survives an unopenable tty' test_harden_ssh_survives_an_unopenable_tty
+t 'sudo asks on a tty despite piped stdin' test_priv_asks_on_tty_even_with_piped_stdin
+t 'peek asks on a tty despite piped stdin' test_peek_asks_on_tty_even_with_piped_stdin
+t 'sudo warm-up is not gated on stdin'   test_sudo_prompt_is_not_gated_on_stdin
 t 'listening process survives missing ss'  test_listening_process_survives_missing_ss
 t 'ipv4 ruleset rejects ipv6 subnets'     test_ipv4_ruleset_rejects_ipv6_subnets
 t 'validator requires both markers'       test_validator_requires_both_markers

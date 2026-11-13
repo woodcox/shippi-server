@@ -1,4 +1,5 @@
 #!/bin/bash
+set -o pipefail
 
 # Reinstalls Shippi with missing packages and default configs.
 

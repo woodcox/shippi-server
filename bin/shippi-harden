@@ -2656,7 +2656,7 @@ remove_stale_managed_ssh_rules() {
 configure_ssh_access() {
   local ssh_port="$1"
   local -a sources=()
-  local cidr kind tailnet_ok=0 applied=0 broad_removed=1 failed=0 stale_failed=0
+  local cidr kind tailnet_ok=0 applied=0 broad_removed=1 failed=0 stale_failed=0 tailnet_only=0
 
   SSH_LAN_APPLIED=()
 
@@ -2733,10 +2733,12 @@ configure_ssh_access() {
       note "not changing the firewall policy; pass --ssh-from <cidr> (repeatable)"
       return 1
     fi
-    warn "cannot determine the LAN subnet for SSH; leaving the existing SSH rules unchanged"
-    note "pass --ssh-from <cidr> (repeatable) to restrict SSH to a known source range"
-    note "the tailnet permit was added, but an existing blanket rule may still be world-reachable"
-    return 0
+    # Only the tailnet permit is available. Close the blanket rule anyway: the
+    # operator asked for exposure removal, and the tailnet is the way in. This
+    # can refuse new LAN logins, so say so and verify the tailnet path.
+    tailnet_only=1
+    warn "no LAN SSH permit could be applied; closing the blanket rule"
+    note "pass --ssh-from <cidr> (repeatable) if LAN logins must keep working"
   fi
 
   # The replacement permits are in place. Only now remove the old
@@ -2757,9 +2759,16 @@ configure_ssh_access() {
     fi
   done
 
-  local scope="${SSH_LAN_APPLIED[*]}"
+  local scope=""
+  if ((${#SSH_LAN_APPLIED[@]})); then
+    scope="${SSH_LAN_APPLIED[*]}"
+  fi
   if ((tailnet_ok)); then
-    scope="${scope} and tailscale0"
+    if [[ -n $scope ]]; then
+      scope="${scope} and tailscale0"
+    else
+      scope="tailscale0"
+    fi
   fi
   if ((stale_failed)); then
     warn "some previous scoped SSH permits could not be removed; SSH may still be reachable from an old source"
@@ -2776,7 +2785,11 @@ configure_ssh_access() {
     note "would limit SSH to ${scope}"
   else
     ok "ssh limited to ${scope}"
-    note "existing sessions stay up; verify a new login from each allowed source before closing this one"
+    if ((tailnet_only)); then
+      warn "LAN logins to ${ssh_port} will be refused - verify a tailscale session now"
+    else
+      note "existing sessions stay up; verify a new login from each allowed source before closing this one"
+    fi
   fi
 }
 
@@ -4192,11 +4205,8 @@ main() {
   fi
 }
 
-AUDIT_TMP=""
-if [[ -z $AUDIT_TMP ]]; then
-  AUDIT_TMP="$(mktemp)"
-  trap 'rm -f "$AUDIT_TMP"' EXIT
-fi
+AUDIT_TMP="$(mktemp)"
+trap 'rm -f "$AUDIT_TMP"' EXIT
 
 # Sourcing this file gives you the functions and runs nothing, which is what
 # the tests in the repo do.

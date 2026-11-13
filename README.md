@@ -212,15 +212,17 @@ Some deliberate choices worth knowing before you run it:
   versions, and it removes scoped permits left by an earlier `--ssh-from`
   choice. If no usable LAN or tailnet permit can be established, the firewall
   task stops before changing the default policy; if a requested source fails,
-  it keeps the existing blanket rule and reports the task incomplete. It also
-  reports incomplete when a stale scoped or blanket rule cannot be removed.
-  `.local` names keep working because UFW's stock `before.rules` already
-  permits mDNS on 5353, and the LAN rule covers the private IPv4 subnet and the
-  on-link IPv6 prefixes
-  avahi advertises. If the LAN is not the default-route interface (multi-homed,
-  VLANs), pass `--ssh-from <cidr>` one or more times to replace the detected
-  prefixes. Existing sessions stay up, but verify a new login from each allowed
-  source before closing the old one.
+  it keeps the existing blanket rule and reports the task incomplete. If no LAN
+  prefix is detected but Tailscale is available, it closes the blanket rule
+  anyway and leaves SSH reachable over `tailscale0` only; new LAN logins will
+  be refused, so verify a tailnet session first. It also reports incomplete
+  when a stale scoped or blanket rule cannot be removed. `.local` names keep
+  working because UFW's stock `before.rules` already permits mDNS on 5353, and
+  the LAN rule covers the private IPv4 subnet and the on-link IPv6 prefixes
+  avahi advertises. IPv6-only and public-IPv4 LANs are not auto-detected; pass
+  `--ssh-from <cidr>` one or more times to replace the detected prefixes.
+  Existing sessions stay up, but verify a new login from each allowed source
+  before closing the old one.
 - **Prompts use `gum`**, reading `/dev/tty` directly, so they still appear when
   the script is iterating over ports or accounts. Without a terminal at all it
   says so and takes the documented default rather than silently guessing.

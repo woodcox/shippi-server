@@ -224,24 +224,6 @@ skill_choices_file() {
   printf '%s/.shippi-skill-choices\n' "$HOME/.agents"
 }
 
-# Move the Hermes-only choice file written by the previous installer, so a
-# refresh does not ask about collisions that were already answered. Moving
-# (rather than copying) also means deleting the shared file really does make
-# the installer ask again.
-migrate_hermes_skill_choices() {
-  local shared legacy
-
-  shared="$(skill_choices_file)"
-  legacy="${HERMES_HOME:-$HOME/.hermes}/.shippi-skill-choices"
-  [[ -f $legacy && ! -f $shared ]] || return 0
-  mkdir -p "$(dirname "$shared")" || return 1
-  if mv "$legacy" "$shared"; then
-    echo "Migrated skill choices from $legacy" >&2
-  else
-    echo "Warning: could not migrate $legacy" >&2
-  fi
-}
-
 # Print the stored action for a skill, or fail when there is none. Older
 # choice files wrote a third (rename-target) field; only the first two are
 # read now, because rename targets are regenerated.
@@ -565,8 +547,6 @@ install_ai_skills() {
   local stage tmp_home canonical failed=0
   local -a sources=() fresh=() staged=()
   local -A SKILL_ACTION=()
-
-  migrate_hermes_skill_choices || failed=1
 
   canonical="$(canonical_skills_dir)"
   # A fresh directory per run: two installs started at the same time cannot

@@ -2940,8 +2940,6 @@ test_firewall_loop_visits_every_port() {
   listening_process() { printf 'nginx\n'; }
   stub docker_present
   docker_present() { return 1; }
-  stub docker_published_by
-  docker_published_by() { printf ''; }
   stub have
   have() { return 0; }
   stub ask
@@ -2985,8 +2983,6 @@ test_firewall_skips_the_ssh_port() {
   listening_process() { printf 'sshd\n'; }
   stub docker_present
   docker_present() { return 1; }
-  stub docker_published_by
-  docker_published_by() { printf ''; }
   stub have
   have() { return 0; }
   stub ask
@@ -3019,8 +3015,6 @@ test_firewall_no_deletes_an_existing_allow_rule() {
   listening_process() { printf 'nginx\n'; }
   stub docker_present
   docker_present() { return 1; }
-  stub docker_published_by
-  docker_published_by() { printf ''; }
   stub have
   have() { return 0; }
   stub ask
@@ -3133,8 +3127,6 @@ test_ssh_access_is_scoped_and_removes_the_blanket_rule() {
   have() { return 0; }
   stub docker_present
   docker_present() { return 1; }
-  stub docker_published_by
-  docker_published_by() { printf ''; }
   stub ask
   ask() { return 1; }
   stub run_root
@@ -3162,12 +3154,12 @@ test_ssh_access_is_scoped_and_removes_the_blanket_rule() {
   return $rc
 }
 
-test_ssh_access_leaves_the_blanket_rule_when_lan_is_unknown() {
-  # If detection fails, the safe outcome is to leave the working SSH path
-  # alone and say so, not to delete the blanket permit and strand the box.
+test_ssh_access_closes_blanket_when_only_tailnet_is_known() {
+  # No LAN was detected, but the tailnet permit works. Close the public
+  # blanket rule anyway and warn that new LAN logins will be refused.
   setup_destdir
   DRY_RUN=0
-  local log="$CONF_DEST/run_root.log" rc=0
+  local log="$CONF_DEST/run_root.log" rc=0 frc=0
   : >"$log"
   stub current_ssh_port
   current_ssh_port() { printf '1199\n'; }
@@ -3187,11 +3179,22 @@ test_ssh_access_leaves_the_blanket_rule_when_lan_is_unknown() {
   run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
 
   configure_firewall >/dev/null 2>&1
+  frc=$?
 
-  ! grep -qF 'ufw delete limit 1199/tcp' "$log" || rc=1
-  ! grep -qF 'ufw delete allow 1199/tcp' "$log" || rc=1
-  # But the tailnet permit is still added, so there is a way back in.
+  [[ $frc -eq 0 ]] || {
+    printf '        configure_firewall returned %s, expected success\n' "$frc"
+    rc=1
+  }
   grep -qF 'ufw limit in on tailscale0 to any port 1199 proto tcp' "$log" || rc=1
+  grep -qF 'ufw delete limit 1199/tcp' "$log" || {
+    printf '        the blanket limit rule was not removed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  grep -qF 'ufw delete allow 1199/tcp' "$log" || {
+    printf '        the blanket allow rule was not removed:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  ! grep -qF 'ufw limit from ' "$log" || rc=1
   teardown_destdir
   return $rc
 }
@@ -3355,8 +3358,6 @@ test_ssh_access_refuses_a_fresh_host_with_no_permit() {
   have() { return 0; }
   stub docker_present
   docker_present() { return 1; }
-  stub docker_published_by
-  docker_published_by() { printf ''; }
   stub run_root
   run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
 
@@ -4358,7 +4359,7 @@ t 'declining a port closes it'                          test_firewall_no_deletes
 t 'lan cidrs come from the default route'               test_lan_cidrs_reads_the_default_route_interface
 t 'a public WAN is not treated as the LAN'              test_lan_cidrs_does_not_open_a_public_wan
 t 'ssh access is scoped, not blanket'                   test_ssh_access_is_scoped_and_removes_the_blanket_rule
-t 'unknown lan leaves the ssh rules alone'              test_ssh_access_leaves_the_blanket_rule_when_lan_is_unknown
+t 'tailnet-only closes the blanket when lan is unknown' test_ssh_access_closes_blanket_when_only_tailnet_is_known
 t '--ssh-from replaces auto-detection'                  test_ssh_from_overrides_lan_detection
 t 'managed ssh rules are parsed by ownership'           test_ufw_managed_ssh_sources_reads_only_ours
 t 'stale ssh rules are removed, requested kept'         test_remove_stale_managed_ssh_rules_keeps_requested
@@ -4403,6 +4404,7 @@ t 'public addrs not misclassified'       test_public_addresses_are_not_misclassi
 t 'loopback and tailscale still dropped' test_loopback_and_tailscale_ranges_still_dropped
 t 'docker subnets keeps ipv4'            test_docker_subnets_keeps_ipv4
 t 'managed block keeps mode in practice'    test_managed_block_preserves_mode_and_owner_in_practice
+t 'managed block write keeps mode in practice' test_managed_block_write_preserves_mode_and_owner_in_practice
 t 'unreadable target is refused not truncated' test_managed_block_refuses_rather_than_truncating_an_unreadable_target
 t 'block rewrite allowed on empty remainder' test_managed_block_rewrite_allowed_when_remainder_is_empty
 t 'ufw snapshot cleanup uses run_root'       test_ufw_snapshot_cleanup_uses_run_root

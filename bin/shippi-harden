@@ -3270,9 +3270,18 @@ listening_process() {
   if have ss; then
     pid="$(ss -H -tulnp "sport = :${port}" 2>/dev/null |
       grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)"
-    if [[ -z $pid ]] && [[ $(id -u) -ne 0 ]] && ! sudo -n true &>/dev/null; then
-      printf 'need root'
-      return 0
+    if [[ -z $pid ]] && [[ $(id -u) -ne 0 ]]; then
+      # The unprivileged read hides sockets owned by other users. A cached
+      # sudo ticket is not enough on its own: ss has to be run under it.
+      # peek uses the cached credential or asks on /dev/tty, so a root-owned
+      # service (dockerd, sshd, tailscaled) is named instead of being labelled
+      # "needs root" while a ticket is sitting there unused.
+      pid="$(peek ss -H -tulnp "sport = :${port}" 2>/dev/null |
+        grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)"
+      if [[ -z $pid ]] && ! sudo -n true &>/dev/null; then
+        printf 'need root'
+        return 0
+      fi
     fi
   fi
   if [[ -n $pid ]]; then

@@ -2053,7 +2053,21 @@ configure_firewall() {
         ok "allowed ${proto}/${port}"
       fi
     else
-      skip "left ${proto}/${port} closed"
+      # "No" must close a port an earlier run opened, not merely decline to
+      # add another rule. Without this delete the old allow rule survived and
+      # the output still said "left ... closed".
+      if ((DRY_RUN)); then
+        printf '  %s•%s would close: ufw delete allow %s/%s\n' "$C_DIM" "$C_OFF" "$port" "$proto"
+      else
+        local out
+        if out="$(run_root ufw delete allow "$port/$proto" 2>&1)"; then
+          ok "closed ${proto}/${port}"
+        elif [[ $out == *"non-existent rule"* ]]; then
+          skip "left ${proto}/${port} closed"
+        else
+          warn "could not close ${proto}/${port}: ${out:-command failed}"
+        fi
+      fi
     fi
   done 3< <(listening_ports)
 

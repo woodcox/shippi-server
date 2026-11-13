@@ -2535,6 +2535,41 @@ test_firewall_skips_the_ssh_port() {
   return $rc
 }
 
+test_firewall_no_deletes_an_existing_allow_rule() {
+  # Answering "no" used to skip adding an allow rule, so a port opened by an
+  # earlier run stayed open while the output claimed it was left closed. The
+  # decline path has to delete the existing rule.
+  setup_destdir
+  DRY_RUN=0
+  local log="$CONF_DEST/run_root.log" rc=0
+  : >"$log"
+  stub listening_ports
+  listening_ports() { printf 'tcp 80\n'; }
+  stub current_ssh_port
+  current_ssh_port() { printf '22\n'; }
+  stub listening_process
+  listening_process() { printf 'nginx\n'; }
+  stub docker_present
+  docker_present() { return 1; }
+  stub docker_published_by
+  docker_published_by() { printf ''; }
+  stub have
+  have() { return 0; }
+  stub ask
+  ask() { return 1; }   # answer no to every port
+  stub run_root
+  run_root() { printf '%s\n' "$*" >>"$log"; return 0; }
+
+  configure_firewall >/dev/null 2>&1
+
+  grep -qF 'ufw delete allow 80/tcp' "$log" || {
+    printf '        declining tcp/80 did not delete its allow rule:\n%s\n' "$(cat "$log")"
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
 test_docker_port_is_loopback_only() {
   # The loopback binding is expressed in the HOST port (`-p 127.0.0.1:8080:80`)
   # while the question is about the CONTAINER port. Matching one against the
@@ -2856,6 +2891,7 @@ t 'audit timeout is inside peek'                        test_audit_timeout_is_in
 
 t 'the firewall loop visits every port'                 test_firewall_loop_visits_every_port
 t 'the firewall loop skips the ssh port'                test_firewall_skips_the_ssh_port
+t 'declining a port closes it'                          test_firewall_no_deletes_an_existing_allow_rule
 
 t 'docker loopback port is recognised'                  test_docker_port_is_loopback_only
 t 'docker public+loopback is not loopback'             test_docker_port_public_and_loopback_is_not_loopback_only

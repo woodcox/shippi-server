@@ -1,8 +1,9 @@
 # Original layout, emoji edition. Prompt character stays ASCII on purpose.
+"$schema" = 'https://starship.rs/config-schema.json'
 add_newline = true
 command_timeout = 1000
 
-format = "$directory$git_branch$git_status$character"
+format = "$directory$git_branch$git_status$cmd_duration${custom.pi_thermal}$character"
 
 [character]
 error_symbol = "[x](bold red)"
@@ -19,6 +20,8 @@ repo_root_format = "[$repo_root]($repo_root_style)[$path]($style)[$read_only]($r
 symbol = "🌿 "
 format = "[$symbol$branch]($style) "
 style = "italic blue"
+truncation_length = 32
+truncation_symbol = "..."
 
 [git_status]
 format = '([\[$all_status$ahead_behind\]]($style) )'
@@ -26,7 +29,7 @@ style = "purple"
 ahead = " ⏫ by ${count} "
 behind = " ⏬ by ${count} "
 diverged = " ⏫ by ${ahead_count} & ⏬ by ${behind_count} "
-conflicted = " ⚠️ "
+conflicted = " ⚠️"
 up_to_date = ""
 untracked = " ❓ "
 modified = " ✏️ "
@@ -34,3 +37,14 @@ staged = " ✅ "
 renamed = " 🏷️ "
 deleted = " 🗑️ "
 stashed = " 📦 "
+
+[cmd_duration]
+min_time = 2000
+format = "took $duration "
+style = "bold yellow"
+
+[custom.pi_thermal]
+when = true
+command = 't=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); [ "${t:-0}" -ge 75000 ] && printf "🌡️ %d°C" "$((t / 1000))"'
+shell = ["sh"]
+format = "([$output](bold red) )"

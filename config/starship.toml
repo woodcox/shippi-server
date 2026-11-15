@@ -39,12 +39,12 @@ deleted = " 🗑️ "
 stashed = " 📦 "
 
 [cmd_duration]
-min_time = 2000
-format = "took $duration "
+min_time = 3000
+format = "took [$duration]($style) "
 style = "bold yellow"
 
 [custom.pi_thermal]
 when = true
-command = 't=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); [ "${t:-0}" -ge 75000 ] && printf "🌡️ %d°C" "$((t / 1000))"'
+command = 't=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); [ "${t:-0}" -ge 72000 ] && printf "🌡️ %d°C" "$((t / 1000))"'
 shell = ["sh"]
 format = "([$output](bold red) )"

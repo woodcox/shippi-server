@@ -18,16 +18,6 @@ if command -v zoxide &>/dev/null; then
   eval "$(zoxide init "$_shell_name")"
 fi
 
-# zoxide prepends its hook to Bash's PROMPT_COMMAND, so it runs before
-# starship_precmd and resets $? to 0. Move it into the command Starship
-# preserves, which runs after Starship captures the real exit status.
-if [[ "$_shell_name" == "bash" && -n "${STARSHIP_PROMPT_COMMAND:-}" && "${PROMPT_COMMAND:-}" == *_zoxide_hook* ]]; then
-  if [[ "$STARSHIP_PROMPT_COMMAND" != *_zoxide_hook* ]]; then
-    STARSHIP_PROMPT_COMMAND="_zoxide_hook;$STARSHIP_PROMPT_COMMAND"
-  fi
-  PROMPT_COMMAND="starship_precmd"
-fi
-
 if command -v try &>/dev/null; then
   eval "$(try init ~/Work/tries)"
 fi

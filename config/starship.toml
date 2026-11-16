@@ -1,13 +1,17 @@
-# Original layout, emoji edition. Prompt character stays ASCII on purpose.
+# Emoji starship by woodcox
 "$schema" = 'https://starship.rs/config-schema.json'
 add_newline = true
-command_timeout = 1000
+command_timeout = 300
 
-format = "$directory$git_branch$git_status$cmd_duration${custom.pi_thermal}$character"
+format = "$directory$git_branch$git_status$jobs$memory_usage$cmd_duration${custom.pi_thermal}$status$character"
 
 [character]
 error_symbol = "[x](bold red)"
 success_symbol = "[>](bold cyan)"
+vimcmd_symbol = "[<](bold green)"
+vimcmd_visual_symbol = "[<](bold yellow)"
+vimcmd_replace_symbol = "[<](bold purple)"
+vimcmd_replace_one_symbol = "[<](bold purple)"
 
 [directory]
 truncation_length = 2
@@ -38,8 +42,17 @@ renamed = " 🏷️ "
 deleted = " 🗑️ "
 stashed = " 📦 "
 
+[jobs]
+symbol = "👔 "
+format = "[$symbol]($style)($number )"
+
+[memory_usage]
+disabled = false
+threshold = 85
+format = "[$symbol$ram_pct]($style) "
+
 [cmd_duration]
-min_time = 3000
+min_time = 10000
 format = "took [$duration]($style) "
 style = "bold yellow"
 
@@ -48,3 +61,9 @@ when = true
 command = 't=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); [ "${t:-0}" -ge 72000 ] && printf "🌡️ %d°C" "$((t / 1000))"'
 shell = ["sh"]
 format = "([$output](bold red) )"
+
+[status]
+disabled = false
+map_symbol = true
+symbol = "💥"
+format = '[$symbol $status]($style)( \($common_meaning$signal_name\)) '

@@ -72,26 +72,8 @@ install_packages() {
     curl -fsSL https://tailscale.com/install.sh | sh
   fi
 
-  # Hack Nerd Font (required by Starship prompt)
-  # To update HACK_FONT_VERSION, bump the version number as Nerd Fonts major versions occasionally change glyph mappings.
-  local HACK_FONT_VERSION="3.3.0"
-  local FONT_DIR="$HOME/.local/share/fonts/Hack"
-  local FONT_MARKER="$FONT_DIR/.version"
-
-  if [ ! -f "$FONT_MARKER" ] || [ "$(cat "$FONT_MARKER")" != "$HACK_FONT_VERSION" ]; then
-    section "Installing Hack Nerd Font v$HACK_FONT_VERSION..."
-    mkdir -p "$FONT_DIR"
-    local tmp_zip="/tmp/hack-nerd-font.zip"
-    wget -qO "$tmp_zip" \
-      "https://github.com/ryanoasis/nerd-fonts/releases/download/v${HACK_FONT_VERSION}/Hack.zip"
-    unzip -q "$tmp_zip" -d "$FONT_DIR"
-    rm -f "$tmp_zip"
-    echo "$HACK_FONT_VERSION" > "$FONT_MARKER"
-    fc-cache -fv >/dev/null
-    echo "✓ Hack Nerd Font installed"
-  else
-    echo "Hack Nerd Font already up to date, skipping"
-  fi
+  # Nerd Font (required by Starship prompt)
+  echo "You may need to install a Nerd Font such as Hack for starship.rs"
 
   # starship (not in Debian/Ubuntu repos)
   if ! command -v starship &>/dev/null; then

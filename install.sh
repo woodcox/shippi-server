@@ -9,18 +9,51 @@ show_banner() {
   RED="\e[38;2;197;26;74m"
   RESET="\e[0m"
 
-  echo -e "${RED}   
-███████╗██╗  ██╗██╗██████╗ ██████╗ ██╗
-██╔════╝██║  ██║██║██╔══██╗██╔══██╗██║
-███████╗███████║██║██████╔╝██████╔╝██║
-╚════██║██╔══██║██║██╔═══╝ ██╔═══╝ ██║
-███████║██║  ██║██║██║     ██║     ██║
-╚══════╝╚═╝  ╚═╝╚═╝╚═╝     ╚═╝     ╚═╝
+  echo -e "${RED}
+               ┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻
+               ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃
+               ┗━┛ ╹ ╹ ╹ ╹   ╹   ╹
+                 ─ s e r v e r ─
+                                   ▀▀▀       ▀▀▀
+          ·                       ╱         ╱
+   ·            *             ███▓███   ███▓███
+       *     *               ███▓███   ███▓███
+  .  ▄▄▄▄        . █           ╱      ███▓███
+ ▄▄▄▄▄▄▄▄▄▄▄   *   ███     ███▓███      ╱         ╱
+▒▒▒▒▒    ▀▀▀▀▀     ███    ███▓███   ███▓███   ███▓███
+▒▒▒▒▒░░░░  ▀▀▀▀▀ . ██████   ╱      ███▓███   ███▓███
+▒▒▒▒▒▒▒▒▒░░░░      ███ ██████     ███▓███      ╱
+▓▓▓▓▓▓▓▒▒▒▒▒▒░░░░    █████ ██████   ╱      ███▓███
+▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒░░░░    █████ ██████     ███▓███
+▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    █████ ██████   ╱
+▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    █████ ██████        ▀▀▀            
+█████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    █████ ██████  ███▀     
+█████████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    █████ █████▀ .            
+█████████████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    ████▀ .     *          
   ${RESET}"
 }
 
+# Section headings
+# Only use colors when stdout is a terminal and NO_COLOR isn't set
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    BOLD=$'\033[1m'
+    CYAN=$'\033[36m'
+    DIM=$'\033[2m'
+    RESET=$'\033[0m'
+else
+    BOLD="" CYAN="" DIM="" RESET=""
+fi
+
 section() {
-  echo -e "\n==> $1"
+    local title="$1"
+    local width=${COLUMNS:-60}
+    local rule
+    printf -v rule '%*s' "$width" ''
+    rule=${rule// /─}
+
+    printf '\n%s%s%s\n' "$DIM" "$rule" "$RESET"
+    printf '%s%s▶ %s%s\n' "$BOLD" "$CYAN" "$title" "$RESET"
+    printf '%s%s%s\n\n' "$DIM" "$rule" "$RESET"
 }
 
 # Fetch the latest release tag from the GitHub API.
@@ -56,7 +89,7 @@ github_latest_tag() {
 # ~/.gitconfig so it has a home the installer never touches, and rescue a
 # [user] block an earlier install left behind. Runs before the copies.
 ensure_git_config() {
-  section "Protecting git identity..."
+  section "Git identity"
 
   local managed="$HOME/.config/git/config"
   local user_config="$HOME/.gitconfig"

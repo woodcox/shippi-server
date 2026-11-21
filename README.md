@@ -1,19 +1,12 @@
-# Shippi
+# Shippi-server
 
 A minimal setup for debian based systems like Raspberry Pi OS Lite and Ubuntu in the spirit of Omarchy/[Omaterm](https://github.com/omacom-io/omaterm). This has only been tested on a Raspberry Pi 5 with 8GB ram and SSD storage.
 
 ## Requirements
 
 - Base Raspberry Pi OS Lite, Debian or Ubuntu server installation
-  - Tested on Raspberry Pi OS Lite / Debian 12 (bookworm).
-  - **Ubuntu 24.04 (noble) or newer.** Ubuntu moved sshd to systemd socket
-    activation in 22.10. On 24.04 and later a `Port` change in
-    `sshd_config` is read by a systemd generator, so `shippi-harden` can move
-    the port by reloading and restarting `ssh.socket`. On 22.10 through
-    23.10 there is no such generator: `ssh.socket` uses a fixed
-    `ListenStream=22`, the `Port` directive is ignored, and the script would
-    report a port move that never happened. Those three releases are not
-    supported.
+  - Tested on Raspberry Pi OS Lite (Debian 12 - bookworm).
+  - Untested Ubuntu 24.04 (noble) or newer.
 
 ## Install
 
@@ -49,7 +42,7 @@ And you'll be offered to setup:
 - Tailscale
 - Optional editor (Fresh)
 - Optional AI assistants (opencode, claude-code and hermes-agent)
-- Optional opencode-quota (OpenCode Go usage limits, offered when opencode is installed)
+- Optional opencode-quota (OpenCode usage limits, offered when opencode is installed)
 - Optional tuiboard (terminal kanban on markdown)
 - Optional hunk (terminal diff viewer)
 
@@ -60,9 +53,9 @@ And you'll be offered to setup:
 
 ## Commands
 See `shippi-help` for the command list and Herdr key bindings, and the
-[Herdr docs](https://herdr.dev/docs/) for the full manual. Herdr replaces tmux:
-tabs are tmux windows, workspaces are tmux sessions, and `h` attaches to the
-persistent `Work` session. Shippi provides:
+[Herdr docs](https://herdr.dev/docs/) for the full manual.
+
+Shippi-server provides:
 
  - `shippi-setup`: Git name and email and github cli
  - `shippi-refresh`: Reinstall Shippi with initial configs
@@ -71,7 +64,7 @@ persistent `Work` session. Shippi provides:
 
  - [opencode](https://opencode.ai/): alias `oc`
  - Claude: alias `cc=printf "\033[2J\033[3J\033[H" && claude --permission-mode bypassPermissions`
- - Hermes: alias `ha=hermes`
+ - Hermes-agent: alias `ha=hermes`
  - Docker: alias `d`
  - Lazydocker: alias `lzd`
  - Herdr: alias `h=herdr --session Work`
@@ -80,7 +73,6 @@ persistent `Work` session. Shippi provides:
       - `icx=hdl oc ha`
       - layouts: `hdl`, `hdlm`, `hds`, `hsl`
       - config: `~/.config/herdr/config.toml`
-      - update: `herdr update`
  - Github: alias `gh`
  - Git alias:   
       - `g=git`
@@ -100,16 +92,15 @@ persistent `Work` session. Shippi provides:
  - [tuiboard](https://tuiboard.nazzareno.xyz/): alias `tb`
  - [hunk](https://hunk.dev/): review diffs with `hunk diff`
 
-### opencode-quota
+## Opencode-quota
 
 `opencode-quota` is offered by the installer when opencode is present. It reports the
 quota OpenCode saved last, so it works with opencode closed and never asks a provider.
 
 ```bash
 opencode-quota show                             # Go plan: 5h / Weekly / Monthly bars
-opencode-quota show --provider opencode-go      # only the Go plan
+opencode-quota show --provider opencode-go      # only the Opencode Go plan
 opencode-quota show --json                      # the same cached data as JSON
-opencode-quota show --json --provider copilot   # only Copilot
 opencode-quota show --json --threshold 5        # exit 1 when comparable quota < 5%
 ```
 
@@ -118,10 +109,7 @@ percentage is below it or the command failed, `2` results were incomplete or no
 comparable percentage existed.
 
 Without the global install, `bunx --bun @slkiser/opencode-quota@latest show` does the same and
-also works while opencode is closed. In opencode `/quota` and the `/tokens_*` commands open the sidebar panel; the CLI above works without it,
-but reports whatever the cache last held. See
-[opencode-quota docs](https://github.com/slkiser/opencode-quota/blob/main/docs/readme/external-integration.md)
-for further info.
+also works while opencode is closed. In opencode `/quota` and the `/tokens_*` commands open the sidebar panel; the CLI above works without it, but reports whatever the cache last held. See [opencode-quota docs](https://github.com/slkiser/opencode-quota/blob/main/docs/readme/external-integration.md) for further info.
 
 ## Security hardening
 

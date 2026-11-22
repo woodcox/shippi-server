@@ -6,21 +6,81 @@ show_banner() {
   clear
   echo
 
-  RED="\e[38;2;197;26;74m"
-  RESET="\e[0m"
+  # 4-tier gradient, by glyph weight: ocean green (lightest) -> indigo (densest)
+  local OCEAN=$'\e[38;2;16;185;129m'   # ░ and line art
+  local TEAL=$'\e[38;2;13;148;136m'    # ▒, ▀, ▄
+  local BLUE=$'\e[38;2;37;99;235m'     # ▓
+  local INDIGO=$'\e[38;2;67;56;202m'   # █
+  local WHITE=$'\e[38;2;255;255;255m'  # * . ·
+  local BG=$'\e[48;2;0;0;0m'           # black backdrop
+  local RESET=$'\e[0m'
 
-  echo -e "${RED}   
-███████╗██╗  ██╗██╗██████╗ ██████╗ ██╗
-██╔════╝██║  ██║██║██╔══██╗██╔══██╗██║
-███████╗███████║██║██████╔╝██████╔╝██║
-╚════██║██╔══██║██║██╔═══╝ ██╔═══╝ ██║
-███████║██║  ██║██║██║     ██║     ██║
-╚══════╝╚═╝  ╚═╝╚═╝╚═╝     ╚═╝     ╚═╝
-  ${RESET}"
+  local -a art=(
+    '               ┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻'
+    '               ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
+    '               ┗━┛ ╹ ╹ ╹ ╹   ╹   ╹'
+    '                 ─ s e r v e r ─'
+    '                                   ▀▀▀       ▀▀▀'
+    '          ·                       ╱         ╱'
+    '   ·            *             ███▓███   ███▓███'
+    '       *     *               ███▓███   ███▓███'
+    '  .  ▄▄▄▄        . █           ╱      ███▓███'
+    ' ▄▄▄▄▄▄▄▄▄▄▄   *   ███     ███▓███      ╱         ╱'
+    '▒▒▒▒▒    ▀▀▀▀▀     ███    ███▓███   ███▓███   ███▓███'
+    '▒▒▒▒▒░░░░  ▀▀▀▀▀ . ██████   ╱      ███▓███   ███▓███'
+    '▒▒▒▒▒▒▒▒▒░░░░      ███ ██████     ███▓███      ╱'
+    '▓▓▓▓▓▓▓▒▒▒▒▒▒░░░░    █████ ██████   ╱      ███▓███'
+    '▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒░░░░    █████ ██████     ███▓███'
+    '▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    █████ ██████   ╱'
+    '▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    █████ ██████        ▀▀▀'
+    '█████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    █████ ██████  ███▀'
+    '█████████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    █████ █████▀ .'
+    '█████████████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    ████▀ .     *'
+  )
+
+  # Paint a black card behind the banner so it also reads on light terminals.
+  # The widest art line is 58 columns; leave a two-column margin either side.
+  local blank
+  printf -v blank '%*s' 62 ''
+
+  # Letters and line art stay ocean green; only the shading glyphs change.
+  local line
+  for line in "${art[@]}"; do
+    line="${OCEAN}${line}"
+    line=${line//█/${INDIGO}█${OCEAN}}
+    line=${line//▓/${BLUE}▓${OCEAN}}
+    line=${line//▒/${TEAL}▒${OCEAN}}
+    line=${line//▀/${TEAL}▀${OCEAN}}
+    line=${line//▄/${TEAL}▄${OCEAN}}
+    line=${line//\*/${WHITE}*${OCEAN}}
+    line=${line//./${WHITE}.${OCEAN}}
+    line=${line//·/${WHITE}·${OCEAN}}
+    # Fill the row with black, rewind, then draw the art over it.
+    printf '%s%s\r  %s%s\n' "$BG" "$blank" "$line" "$RESET"
+  done
 }
 
+# Section headings
+# Only use colors when stdout is a terminal and NO_COLOR isn't set
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    BOLD=$'\033[1m'
+    CYAN=$'\033[36m'
+    DIM=$'\033[2m'
+    RESET=$'\033[0m'
+else
+    BOLD="" CYAN="" DIM="" RESET=""
+fi
+
 section() {
-  echo -e "\n==> $1"
+    local title="$1"
+    local width=${COLUMNS:-60}
+    local rule
+    printf -v rule '%*s' "$width" ''
+    rule=${rule// /─}
+
+    printf '\n%s%s%s\n' "$DIM" "$rule" "$RESET"
+    printf '%s%s▶ %s%s\n' "$BOLD" "$CYAN" "$title" "$RESET"
+    printf '%s%s%s\n\n' "$DIM" "$rule" "$RESET"
 }
 
 # Fetch the latest release tag from the GitHub API.
@@ -56,7 +116,7 @@ github_latest_tag() {
 # ~/.gitconfig so it has a home the installer never touches, and rescue a
 # [user] block an earlier install left behind. Runs before the copies.
 ensure_git_config() {
-  section "Protecting git identity..."
+  section "Git identity"
 
   local managed="$HOME/.config/git/config"
   local user_config="$HOME/.gitconfig"

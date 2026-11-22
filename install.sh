@@ -6,14 +6,13 @@ show_banner() {
   clear
   echo
 
-  # 4-tier gradient, top to bottom: ocean green -> teal -> blue -> indigo
-  local OCEAN=$'\e[38;2;16;185;129m'
-  local TEAL=$'\e[38;2;13;148;136m'
-  local BLUE=$'\e[38;2;37;99;235m'
-  local INDIGO=$'\e[38;2;67;56;202m'
+  # 4-tier gradient, by glyph weight: ocean green (lightest) -> indigo (densest)
+  local OCEAN=$'\e[38;2;16;185;129m'   # ░ and line art
+  local TEAL=$'\e[38;2;13;148;136m'    # ▒, ▀, ▄
+  local BLUE=$'\e[38;2;37;99;235m'     # ▓
+  local INDIGO=$'\e[38;2;67;56;202m'   # █
   local RESET=$'\e[0m'
 
-  local -a tiers=("$OCEAN" "$TEAL" "$BLUE" "$INDIGO")
   local -a art=(
     '               ┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻'
     '               ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
@@ -37,10 +36,16 @@ show_banner() {
     '█████████████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    ████▀ .     *'
   )
 
-  local i tier
-  for ((i = 0; i < ${#art[@]}; i++)); do
-    tier=$((i * ${#tiers[@]} / ${#art[@]}))
-    printf '%s%s%s\n' "${tiers[tier]}" "${art[i]}" "$RESET"
+  # Letters and line art stay ocean green; only the shading glyphs change.
+  local line
+  for line in "${art[@]}"; do
+    line="${OCEAN}${line}${RESET}"
+    line=${line//█/${INDIGO}█${OCEAN}}
+    line=${line//▓/${BLUE}▓${OCEAN}}
+    line=${line//▒/${TEAL}▒${OCEAN}}
+    line=${line//▀/${TEAL}▀${OCEAN}}
+    line=${line//▄/${TEAL}▄${OCEAN}}
+    printf '%s\n' "$line"
   done
 }
 

@@ -17,8 +17,9 @@
 # Sourced by install.sh; relies on section, detect_arch and github_latest_tag
 # from the installer.
 
+section "Installing binaries from Github releases"
+
 install_msedit_binary() {
-  section "Installing MS Edit from GitHub releases..."
 
   local arch
   local current_version
@@ -72,7 +73,6 @@ install_msedit_binary() {
 }
 
 install_yazi_binary() {
-  section "Installing Yazi from GitHub releases..."
 
   local arch
   local current_version

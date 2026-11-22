@@ -81,7 +81,9 @@ DEFAULT_TASKS=(packages users accounts services ssh firewall fail2ban updates ap
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
-if [[ -t 1 ]]; then
+# Section headings
+# Only use colors when stdout is a terminal and NO_COLOR isn't set
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   C_RED=$'\033[38;2;197;26;74m'
   C_DIM=$'\033[2m'
   C_BOLD=$'\033[1m'
@@ -90,7 +92,19 @@ else
   C_RED="" C_DIM="" C_BOLD="" C_OFF=""
 fi
 
-section() { printf '\n%s==> %s%s\n' "$C_BOLD" "$1" "$C_OFF"; }
+
+section() {
+    local title="$1"
+    local width=${COLUMNS:-40}
+    local rule
+    printf -v rule '%*s' "$width" ''
+    rule=${rule// /─}
+
+    printf '\n%s%s%s\n' "$C_DIM" "$rule" "$C_OFF"
+    printf '%s%s▶ %s%s\n' "$C_BOLD" "$C_RED" "$title" "$C_OFF"
+    printf '%s%s%s\n\n' "$C_DIM" "$rule" "$C_OFF"
+}
+
 step() { printf '  %s\n' "$1"; }
 ok() { printf '  %s✓%s %s\n' "$C_RED" "$C_OFF" "$1"; }
 warn() { printf '  %s!%s %s\n' "$C_RED" "$C_OFF" "$1" >&2; }
@@ -4226,7 +4240,24 @@ main() {
     fi
   done
 
-  printf '%s   shippi  security hardening%s\n' "$C_RED" "$C_OFF"
+
+  banner() {
+    local CYAN=$'\e[36m'
+    local RESET=$'\e[0m'
+    local -a art=(
+        '  ┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻'
+        '  ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
+        '  ┗━┛ ╹ ╹ ╹ ╹   ╹   ╹'
+        '    ─ s e r v e r ─'
+    )
+
+    printf '\n%b' "${CYAN}"
+    printf '%s\n' "${art[@]}"
+    printf '%b\n\n' "${RESET}"
+  }
+
+  banner
+  printf '%s   security hardening%s\n' "$C_RED" "$C_OFF"
   if ((DRY_RUN)); then
     printf '%s   dry run: nothing is changed, no service is restarted%s\n' "$C_DIM" "$C_OFF"
   fi
@@ -4266,7 +4297,7 @@ main() {
   if ((DRY_RUN)); then
     printf '\n%s   dry run. Re-run without --dry-run when this looks right.%s\n' "$C_DIM" "$C_OFF"
   fi
-}
+
 
 AUDIT_TMP="$(mktemp)"
 trap 'rm -f "$AUDIT_TMP"' EXIT

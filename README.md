@@ -7,6 +7,10 @@ A minimal setup for debian based systems like Raspberry Pi OS Lite and Ubuntu in
 - Base Raspberry Pi OS Lite, Debian or Ubuntu server installation
   - Tested on Raspberry Pi OS Lite (Debian 12 - bookworm).
   - Untested Ubuntu 24.04 (noble) or newer.
+  - Ubuntu 22.10 through 23.10 are not supported. On these releases,
+    `ssh.socket` uses a fixed `ListenStream=22`, so a `Port` change in
+    `sshd_config` is ignored. `shippi-harden` would report a port move that
+    did not happen.
 
 ## Install
 

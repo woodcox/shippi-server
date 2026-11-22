@@ -4198,6 +4198,21 @@ known_task() {
   return 1
 }
 
+banner() {
+  local CYAN=$'\e[36m'
+  local RESET=$'\e[0m'
+  local -a art=(
+      '  ┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻'
+      '  ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
+      '  ┗━┛ ╹ ╹ ╹ ╹   ╹   ╹'
+      '    ─ s e r v e r ─'
+  )
+
+  printf '\n%b' "${CYAN}"
+  printf '%s\n' "${art[@]}"
+  printf '%b\n\n' "${RESET}"
+}
+
 main() {
   while (($# > 0)); do
     case "$1" in
@@ -4239,22 +4254,6 @@ main() {
       return 2
     fi
   done
-
-
-  banner() {
-    local CYAN=$'\e[36m'
-    local RESET=$'\e[0m'
-    local -a art=(
-        '  ┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻'
-        '  ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
-        '  ┗━┛ ╹ ╹ ╹ ╹   ╹   ╹'
-        '    ─ s e r v e r ─'
-    )
-
-    printf '\n%b' "${CYAN}"
-    printf '%s\n' "${art[@]}"
-    printf '%b\n\n' "${RESET}"
-  }
 
   banner
   printf '%s   security hardening%s\n' "$C_RED" "$C_OFF"

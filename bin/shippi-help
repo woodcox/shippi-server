@@ -19,15 +19,15 @@ RESET="\e[0m"
 
 banner() {
   local -a art=(
-      '                  ┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻'
-      '                  ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
-      '                  ┗━┛ ╹ ╹ ╹ ╹   ╹   ╹'
-      '                    ─ s e r v e r ─'
+      '┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻'
+      '┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
+      '┗━┛ ╹ ╹ ╹ ╹   ╹   ╹'
+      '  ─ s e r v e r ─'
   )
 
-  printf '\n%s' "$CYAN"
+  printf '\n%s' "${CYAN}"
   printf '%s\n' "${art[@]}"
-  printf '%s\n\n' "$RESET"
+  printf '%s\n\n' "${RESET}"
 }
 
 # Helpers

@@ -11,6 +11,7 @@ show_banner() {
   local TEAL=$'\e[38;2;13;148;136m'    # ▒, ▀, ▄
   local BLUE=$'\e[38;2;37;99;235m'     # ▓
   local INDIGO=$'\e[38;2;67;56;202m'   # █
+  local WHITE=$'\e[38;2;255;255;255m'  # * . ·
   local RESET=$'\e[0m'
 
   local -a art=(
@@ -45,6 +46,9 @@ show_banner() {
     line=${line//▒/${TEAL}▒${OCEAN}}
     line=${line//▀/${TEAL}▀${OCEAN}}
     line=${line//▄/${TEAL}▄${OCEAN}}
+    line=${line//\*/${WHITE}*${OCEAN}}
+    line=${line//./${WHITE}.${OCEAN}}
+    line=${line//·/${WHITE}·${OCEAN}}
     printf '%s\n' "$line"
   done
 }

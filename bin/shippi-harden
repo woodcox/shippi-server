@@ -85,11 +85,12 @@ DEFAULT_TASKS=(packages users accounts services ssh firewall fail2ban updates ap
 # Only use colors when stdout is a terminal and NO_COLOR isn't set
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   C_RED=$'\033[38;2;197;26;74m'
+  C_GREEN=$'\e[38;2;34;197;94m'
   C_DIM=$'\033[2m'
   C_BOLD=$'\033[1m'
   C_OFF=$'\033[0m'
 else
-  C_RED="" C_DIM="" C_BOLD="" C_OFF=""
+  C_RED="" C_GREEN="" C_DIM="" C_BOLD="" C_OFF=""
 fi
 
 
@@ -103,6 +104,10 @@ section() {
     printf '\n%s%s%s\n' "$C_DIM" "$rule" "$C_OFF"
     printf '%s%s▶ %s%s\n' "$C_BOLD" "$C_RED" "$title" "$C_OFF"
     printf '%s%s%s\n\n' "$C_DIM" "$rule" "$C_OFF"
+}
+
+haeding() {
+  printf '\n%s-- %s --%s\n' "$C_GREEN" "$1" "$C_OFF"
 }
 
 step() { printf '  %s\n' "$1"; }
@@ -4015,7 +4020,7 @@ audit() {
     printf 'shippi security audit - %s\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
     printf 'host: %s   os: %s\n' "$(hostname)" "$pretty"
 
-    printf '\n-- listening ports --\n'
+    heading "listening ports"
     # Compared against the unique list, not the raw per-line output: a port
     # that shows up twice would print twice and read like two open ports.
     local ports
@@ -4029,28 +4034,28 @@ audit() {
       printf '  (none, or not enough privilege to enumerate them)\n'
     fi
 
-    printf '\n-- ufw --\n'
+    heading "ufw"
     if have ufw; then
       peek ufw status verbose 2>/dev/null | sed 's/^/  /' || printf '  unavailable\n'
     else
       printf '  not installed\n'
     fi
 
-    printf '\n-- sshd (effective) --\n'
+    heading "sshd (effective)"
     if line="$(peek sshd -T 2>/dev/null | grep -iE '^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitemptypasswords|maxauthtries|maxsessions|logingracetime|x11forwarding|allowusers|allowtcpforwarding) ' )"; then
       printf '%s\n' "$line" | sed 's/^/  /'
     else
       printf '  unavailable (needs root)\n'
     fi
 
-    printf '\n-- fail2ban --\n'
+    heading "fail2ban"
     if have fail2ban-client && peek fail2ban-client status &>/dev/null; then
       peek fail2ban-client status 2>/dev/null | sed 's/^/  /'
     else
       printf '  not running\n'
     fi
 
-    printf '\n-- unattended upgrades --\n'
+    heading "unattended upgrades"
     peek apt-config dump 2>/dev/null |
       grep -E 'Unattended-Upgrade::(Allowed-Origins|Automatic-Reboot|Package-Blacklist)' |
       sed 's/^/  /' || printf '  not configured\n'
@@ -4062,7 +4067,7 @@ audit() {
     printf '  held back by apt upgrade: %s\n' \
       "$(held_back_packages | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)"
 
-    printf '\n-- kernel patching --\n'
+    heading "kernel patching"
     # A kernel image no package owns can never be upgraded, so it stops
     # receiving security patches with nothing anywhere complaining: apt has no
     # newer one to pull, so no timer fires and no report mentions it. The
@@ -4087,18 +4092,20 @@ audit() {
     else
       printf '  every kernel image in /boot is owned by a package\n'
     fi
-    printf '\n-- system health --\n'
+
+    heading "system health"
     audit_system_health
-    printf '\n-- apparmor --\n'
+
+    heading "apparmour"
     peek aa-status 2>/dev/null | head -6 | sed 's/^/  /' || printf '  not installed\n'
 
-    printf '\n-- sysctl --\n'
+    heading "sysctl"
     printf '  file: %s\n' "$([[ -f ${CONF_DEST}/etc/sysctl.d/99-shippi-hardening.conf ]] &&
       echo present || echo absent)"
     peek sysctl net.ipv4.conf.all.rp_filter net.ipv4.tcp_syncookies 2>/dev/null |
       sed 's/^/  /' || true
 
-    printf '\n-- accounts --\n'
+    heading "accounts"
     printf '  passwordless: %s\n' \
       "$(peek awk -F: '($2 == "") {print $1}' /etc/shadow 2>/dev/null | tr '\n' ' ' || true)"
     printf '  uid 0: %s\n' \
@@ -4107,19 +4114,19 @@ audit() {
     printf '  sudoers: %s\n' \
       "$(peek getent group sudo 2>/dev/null | cut -d: -f4 || echo '?')"
 
-    printf '\n-- service minimisation --\n'
+    heading "service minimisation"
     if have systemctl; then
       service_state_summary
     else
       printf '  systemctl unavailable\n'
     fi
 
-    printf '\n-- recent auth failures --\n'
+    heading "recent auth failures"
     peek journalctl -u ssh --since '-24 hours' --no-pager 2>/dev/null |
       grep -ciE 'failed|invalid|refused' |
       awk '{print "  ssh failures in 24h: " $1}' || true
 
-    printf '\n-- filesystem --\n'
+    heading "filesystem"
     printf '  %s\n' "$(peek df -h / 2>/dev/null | tail -1 || true)"
     # timeout must go inside peek, not around it: timeout execs an external
     # program and cannot run a shell function, so `timeout 60 peek find ...`
@@ -4256,7 +4263,7 @@ main() {
   done
 
   banner
-  printf '%s   security hardening%s\n' "$C_RED" "$C_OFF"
+  printf '%s  security hardening%s\n' "$C_RED" "$C_OFF"
   if ((DRY_RUN)); then
     printf '%s   dry run: nothing is changed, no service is restarted%s\n' "$C_DIM" "$C_OFF"
   fi

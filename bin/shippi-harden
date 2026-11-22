@@ -4296,7 +4296,7 @@ main() {
   if ((DRY_RUN)); then
     printf '\n%s   dry run. Re-run without --dry-run when this looks right.%s\n' "$C_DIM" "$C_OFF"
   fi
-
+}
 
 AUDIT_TMP="$(mktemp)"
 trap 'rm -f "$AUDIT_TMP"' EXIT

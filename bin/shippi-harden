@@ -106,7 +106,7 @@ section() {
     printf '%s%s%s\n\n' "$C_DIM" "$rule" "$C_OFF"
 }
 
-haeding() {
+heading() {
   printf '\n%s-- %s --%s\n' "$C_GREEN" "$1" "$C_OFF"
 }
 

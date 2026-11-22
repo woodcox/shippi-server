@@ -17,8 +17,6 @@
 # Sourced by install.sh; relies on section, detect_arch and github_latest_tag
 # from the installer.
 
-section "Installing binaries from Github releases"
-
 install_msedit_binary() {
 
   local arch

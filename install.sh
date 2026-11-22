@@ -9,22 +9,22 @@ show_banner() {
   # 4-tier gradient, by glyph weight: ocean green (lightest) -> indigo (densest)
   local OCEAN=$'\e[38;2;16;185;129m'   # ░ and line art
   local TEAL=$'\e[38;2;13;148;136m'    # ▒, ▀, ▄
-  local BLUE=$'\e[38;2;37;99;235m'     # ▓
+  local CYAN=$'\e[36m'                 # ▓
   local INDIGO=$'\e[38;2;67;56;202m'   # █
   local WHITE=$'\e[38;2;255;255;255m'  # * . ·
   local BG=$'\e[48;2;0;0;0m'           # black backdrop
   local RESET=$'\e[0m'
 
   local -a art=(
-    '               ┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻'
-    '               ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
-    '               ┗━┛ ╹ ╹ ╹ ╹   ╹   ╹'
-    '                 ─ s e r v e r ─'
+    '                  ┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻'
+    '                  ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
+    '                  ┗━┛ ╹ ╹ ╹ ╹   ╹   ╹'
+    '                    ─ s e r v e r ─'
     '                                   ▀▀▀       ▀▀▀'
     '          ·                       ╱         ╱'
     '   ·            *             ███▓███   ███▓███'
     '       *     *               ███▓███   ███▓███'
-    '  .  ▄▄▄▄        . █           ╱      ███▓███'
+    '  .  ▄▄▄▄        . █           ╱      ███▓███      ▀▀▀'
     ' ▄▄▄▄▄▄▄▄▄▄▄   *   ███     ███▓███      ╱         ╱'
     '▒▒▒▒▒    ▀▀▀▀▀     ███    ███▓███   ███▓███   ███▓███'
     '▒▒▒▒▒░░░░  ▀▀▀▀▀ . ██████   ╱      ███▓███   ███▓███'
@@ -48,7 +48,7 @@ show_banner() {
   for line in "${art[@]}"; do
     line="${OCEAN}${line}"
     line=${line//█/${INDIGO}█${OCEAN}}
-    line=${line//▓/${BLUE}▓${OCEAN}}
+    line=${line//▓/${CYAN}▓${OCEAN}}
     line=${line//▒/${TEAL}▒${OCEAN}}
     line=${line//▀/${TEAL}▀${OCEAN}}
     line=${line//▄/${TEAL}▄${OCEAN}}
@@ -73,7 +73,7 @@ fi
 
 section() {
     local title="$1"
-    local width=${COLUMNS:-60}
+    local width=${COLUMNS:-40}
     local rule
     printf -v rule '%*s' "$width" ''
     rule=${rule// /─}
@@ -168,6 +168,7 @@ interactive_setup() {
       fi
     fi
   fi
+  echo "✓ Interactive setup complete"
 }
 
 finish() {
@@ -232,6 +233,8 @@ run_installation() {
 
   # Optional tools
   install_optional_ai_tools
+
+  section "Install optional tools..."
   install_optional_tuiboard
   install_optional_hunk
 
@@ -278,7 +281,7 @@ fi
 source "$INSTALLER_DIR/install/docker.sh"
 source "$INSTALLER_DIR/install/runtime.sh"
 source "$INSTALLER_DIR/install/config.sh"
-source "$INSTALLER_DIR/install/binary.sh"
+source "$INSTALLER_DIR/install/gh-binary.sh"
 source "$INSTALLER_DIR/install/ai-tools.sh"
 
 run_installation

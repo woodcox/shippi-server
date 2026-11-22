@@ -27,7 +27,7 @@ banner() {
 
   printf '\n%b' "${CYAN}"
   printf '%s\n' "${art[@]}"
-  printf '%s\n\n' "${RESET}"
+  printf '%b\n\n' "${RESET}"
 }
 
 # Helpers

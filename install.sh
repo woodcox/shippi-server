@@ -12,6 +12,7 @@ show_banner() {
   local BLUE=$'\e[38;2;37;99;235m'     # ▓
   local INDIGO=$'\e[38;2;67;56;202m'   # █
   local WHITE=$'\e[38;2;255;255;255m'  # * . ·
+  local BG=$'\e[48;2;0;0;0m'           # black backdrop
   local RESET=$'\e[0m'
 
   local -a art=(
@@ -37,10 +38,15 @@ show_banner() {
     '█████████████████▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░░░░    ████▀ .     *'
   )
 
+  # Paint a black card behind the banner so it also reads on light terminals.
+  # The widest art line is 58 columns; leave a two-column margin either side.
+  local blank
+  printf -v blank '%*s' 62 ''
+
   # Letters and line art stay ocean green; only the shading glyphs change.
   local line
   for line in "${art[@]}"; do
-    line="${OCEAN}${line}${RESET}"
+    line="${OCEAN}${line}"
     line=${line//█/${INDIGO}█${OCEAN}}
     line=${line//▓/${BLUE}▓${OCEAN}}
     line=${line//▒/${TEAL}▒${OCEAN}}
@@ -49,7 +55,8 @@ show_banner() {
     line=${line//\*/${WHITE}*${OCEAN}}
     line=${line//./${WHITE}.${OCEAN}}
     line=${line//·/${WHITE}·${OCEAN}}
-    printf '%s\n' "$line"
+    # Fill the row with black, rewind, then draw the art over it.
+    printf '%s%s\r  %s%s\n' "$BG" "$blank" "$line" "$RESET"
   done
 }
 

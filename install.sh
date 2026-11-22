@@ -73,7 +73,7 @@ fi
 
 section() {
     local title="$1"
-    local width=${COLUMNS:-60}
+    local width=${COLUMNS:-40}
     local rule
     printf -v rule '%*s' "$width" ''
     rule=${rule// /─}

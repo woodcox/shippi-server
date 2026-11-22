@@ -25,7 +25,7 @@ banner() {
       '  ─ s e r v e r ─'
   )
 
-  printf '\n%s' "${CYAN}"
+  printf '\n%b' "${CYAN}"
   printf '%s\n' "${art[@]}"
   printf '%s\n\n' "${RESET}"
 }
@@ -279,7 +279,6 @@ page_functions() {
 # Main menu
 while true; do
   clear
-  echo ""
   banner
 
   CHOICE=$(gum choose \

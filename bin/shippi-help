@@ -120,6 +120,7 @@ page_commands() {
   cmd "lta" "eza tree including hidden"
 
   section "Productivity"
+  cmd "ed"  "MS Edit"
   cmd "tb"  "tuiboard (terminal kanban on markdown)"
 
   section "SSH Port Forwarding"

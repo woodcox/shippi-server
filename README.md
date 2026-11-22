@@ -89,6 +89,7 @@ Shippi-server provides:
       - `lt` for listing of two-deep levels of nesting
       - `lsa` for listing including hidden files
       - `lta` for a nested listing with hidden files
+ - MS Edit: alias `ed`
  - [Btop](https://github.com/aristocratos/btop)
  - [Yazi](https://github.com/sxyazi/yazi) file manager alias: `y` opens it and changes
    the shell to the last directory on exit (`Q` quits without changing)

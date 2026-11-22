@@ -543,6 +543,7 @@ skill_needs_batch() {
 # ground, an isolated HOME for anything that would touch a foreign entry), and
 # a final reconciliation pass creates the per-agent entries.
 install_ai_skills() {
+  section "Install AI skills..."
   local entry source skill action src cname dir label needs_write
   local stage tmp_home canonical failed=0
   local -a sources=() fresh=() staged=()
@@ -747,7 +748,7 @@ install_ai_skills() {
 }
 
 install_optional_ai_tools() {
-  section "Optional AI coding assistants..."
+  section "Optional AI tooling..."
 
   if ! command -v bun &>/dev/null; then
     echo "Skipping AI assistants (bun not found)."

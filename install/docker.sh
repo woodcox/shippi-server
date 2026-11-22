@@ -6,7 +6,7 @@
 #
 # See: https://docs.docker.com/engine/install/debian/ for docker install guidance
 install_docker() {
-  echo "Installing Docker..."
+  section "Installing Docker..."
 
   set -e  # stop on error
 

@@ -13,6 +13,7 @@ install_bun() {
   if ! command -v bun &>/dev/null; then
     section "Installing Bun..."
     curl -fsSL https://bun.sh/install | bash
+    echo "✓ bun installed"
   fi
 }
 
@@ -32,7 +33,6 @@ install_mise() {
 # is no package.json fallback: if doctor cannot report a version, the install
 # is treated as absent. This is dependant on jq.
 install_optional_tuiboard() {
-  section "Optional tuiboard..."
 
   if ! command -v bun &>/dev/null; then
     echo "Skipping tuiboard (bun not found)."
@@ -93,7 +93,6 @@ install_optional_tuiboard() {
 # it exposes the `hunk` executable. `hunk --version` prints a bare version,
 # so no parsing is needed.
 install_optional_hunk() {
-  section "Optional hunk..."
 
   if ! command -v bun &>/dev/null; then
     echo "Skipping hunk (bun not found)."

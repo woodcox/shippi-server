@@ -14,7 +14,6 @@ ensure_trailing_newline() {
 }
 
 install_dots() {
-  section "Installing dots configs..."
 
   section "Copying dots to ~/.config..."
   mkdir -p "$HOME/.config"

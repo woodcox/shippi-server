@@ -20,6 +20,7 @@ show_banner() {
     '                  ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
     '                  ┗━┛ ╹ ╹ ╹ ╹   ╹   ╹'
     '                    ─ s e r v e r ─'
+    ''
     '                                   ▀▀▀       ▀▀▀'
     '          ·                       ╱         ╱'
     '   ·            *             ███▓███   ███▓███'
@@ -212,6 +213,7 @@ run_installation() {
   install_dots
 
   # MS Edit binary: the default $EDITOR
+  section "Installing binaries from Github releases"
   install_msedit_binary
 
   # Yazi binary: the interactive file manager, plus its ya CLI

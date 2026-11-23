@@ -3108,6 +3108,39 @@ test_audit_timeout_is_inside_peek() {
   return $rc
 }
 
+test_audit_hints_show_where_to_edit() {
+  # The audit tells you what is wrong; the hint tells you which file to open.
+  # Both the cd and the sudo command are dim so the hint recedes behind the
+  # report data, and plain output stays plain when colors are disabled.
+  local rc=0 out body
+
+  out="$(C_DIM=$'\033[2m' C_OFF=$'\033[0m' \
+    config_hint /etc/fail2ban "sudo nano jail.d/shippi-hardening.local")"
+  [[ $out == *$'\033[2mcd /etc/fail2ban\033[0m'* ]] || {
+    printf '        cd path was not dimmed:\n%s\n' "$out"
+    rc=1
+  }
+  [[ $out == *$'\033[2msudo nano jail.d/shippi-hardening.local\033[0m'* ]] || {
+    printf '        sudo command was not dimmed:\n%s\n' "$out"
+    rc=1
+  }
+
+  out="$(C_DIM= C_OFF= config_hint /etc/ssh "sudo nano sshd_config")"
+  [[ $out == $'  cd /etc/ssh\n  sudo nano sshd_config' ]] || {
+    printf '        plain hint was not plain:\n%s\n' "$out"
+    rc=1
+  }
+
+  body="$(declare -f audit)"
+  [[ $body == *'config_hint /etc/ufw'* ]] || rc=1
+  [[ $body == *'config_hint /etc/ssh'* ]] || rc=1
+  [[ $body == *'config_hint /etc/fail2ban'* ]] || rc=1
+  [[ $body == *'config_hint /etc/sysctl.d'* ]] || rc=1
+  [[ $body == *'heading "apparmor"'* ]] || rc=1
+  [[ $body != *'heading "apparmour"'* ]] || rc=1
+  return $rc
+}
+
 # main() with the audit task selected and every other task disabled, so the
 # prompt's control flow can be exercised without touching the host. The test
 # functions below replace banner/ask/audit/manual_followups and stub have() to
@@ -4772,6 +4805,7 @@ t 'pending reboot lists requesting packages'            test_pending_reboot_summ
 t 'newest installed kernel is version-sorted'           test_newest_installed_kernel_sorts_versions
 t 'failed units returns unit names only'                test_failed_systemd_units_returns_unit_names
 t 'audit timeout is inside peek'                        test_audit_timeout_is_inside_peek
+t 'audit hints point at config files'                   test_audit_hints_show_where_to_edit
 t 'audit is offered after the run'                      test_audit_prompt_offered_after_main_output
 t 'declining the audit runs nothing'                    test_audit_prompt_declined_runs_nothing
 t '--audit and --yes skip the audit prompt'             test_audit_flag_and_yes_skip_the_prompt

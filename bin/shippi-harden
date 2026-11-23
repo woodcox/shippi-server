@@ -4198,6 +4198,7 @@ manual_followups() {
 
   6. VLAN-isolate this box if the network has more than a handful of devices.
      Network segmentation beats every setting in this script.
+
 EOF
 }
 

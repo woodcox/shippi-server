@@ -3108,6 +3108,102 @@ test_audit_timeout_is_inside_peek() {
   return $rc
 }
 
+# main() with the audit task selected and every other task disabled, so the
+# prompt's control flow can be exercised without touching the host. The test
+# functions below replace banner/ask/audit/manual_followups and stub have() to
+# false, which also stops main's sudo warm-up.
+stub_main_audit() {
+  stub banner
+  banner() { :; }
+  stub have
+  have() { return 1; }
+  stub audit
+  audit() { printf 'AUDIT-RAN\n'; }
+  stub manual_followups
+  manual_followups() { printf 'FOLLOWUPS-PRINTED\n'; }
+  stub ask
+  SELECTED=(audit)
+  DRY_RUN=0
+  ASSUME_YES=0
+}
+
+test_audit_prompt_offered_after_main_output() {
+  # RUN_AUDIT=0 keeps the audit out of the run, but the user should get one
+  # last chance to run it after main has printed its follow-ups, and a yes
+  # must actually run the audit.
+  setup_destdir
+  local rc=0 out
+  stub_main_audit
+  ask() { printf 'AUDIT-PROMPT\n'; return 0; }
+  RUN_AUDIT=0
+
+  out="$(main 2>&1)"
+  [[ $out == *"FOLLOWUPS-PRINTED"*"AUDIT-PROMPT"*"AUDIT-RAN"* ]] || {
+    printf '        prompt/audit order was wrong:\n%s\n' "$out"
+    rc=1
+  }
+  teardown_destdir
+  SELECTED=()
+  RUN_AUDIT=0
+  return $rc
+}
+
+test_audit_prompt_declined_runs_nothing() {
+  setup_destdir
+  local rc=0 out
+  stub_main_audit
+  ask() { printf 'AUDIT-PROMPT\n'; return 1; }
+  RUN_AUDIT=0
+
+  out="$(main 2>&1)"
+  [[ $out == *"AUDIT-PROMPT"* ]] || {
+    printf '        the audit was not offered\n'
+    rc=1
+  }
+  [[ $out != *"AUDIT-RAN"* ]] || {
+    printf '        the audit ran after being declined\n'
+    rc=1
+  }
+  teardown_destdir
+  SELECTED=()
+  RUN_AUDIT=0
+  return $rc
+}
+
+test_audit_flag_and_yes_skip_the_prompt() {
+  # --audit is the explicit request, and --yes is documented as
+  # noninteractive, so neither may ask. --yes must also leave the default
+  # RUN_AUDIT=0 alone instead of quietly running the audit.
+  setup_destdir
+  local rc=0 out
+  stub_main_audit
+  ask() { printf 'AUDIT-PROMPT\n'; return 0; }
+
+  RUN_AUDIT=1
+  out="$(main 2>&1)"
+  [[ $out == *"AUDIT-RAN"* ]] || {
+    printf '        --audit did not run the audit\n'
+    rc=1
+  }
+  [[ $out != *"AUDIT-PROMPT"* ]] || {
+    printf '        --audit still prompted\n'
+    rc=1
+  }
+
+  RUN_AUDIT=0
+  ASSUME_YES=1
+  out="$(main 2>&1)"
+  [[ $out != *"AUDIT-PROMPT"* && $out != *"AUDIT-RAN"* ]] || {
+    printf '        --yes prompted or ran the audit\n'
+    rc=1
+  }
+
+  teardown_destdir
+  SELECTED=()
+  RUN_AUDIT=0
+  return $rc
+}
+
 test_firewall_loop_visits_every_port() {
   # Regression: `IFS= read -r proto port` on a two-field read disables word
   # splitting, so the whole "tcp 80" line went into $proto and $port stayed
@@ -4676,6 +4772,9 @@ t 'pending reboot lists requesting packages'            test_pending_reboot_summ
 t 'newest installed kernel is version-sorted'           test_newest_installed_kernel_sorts_versions
 t 'failed units returns unit names only'                test_failed_systemd_units_returns_unit_names
 t 'audit timeout is inside peek'                        test_audit_timeout_is_inside_peek
+t 'audit is offered after the run'                      test_audit_prompt_offered_after_main_output
+t 'declining the audit runs nothing'                    test_audit_prompt_declined_runs_nothing
+t '--audit and --yes skip the audit prompt'             test_audit_flag_and_yes_skip_the_prompt
 
 t 'the firewall loop visits every port'                 test_firewall_loop_visits_every_port
 t 'the firewall loop skips the ssh port'                test_firewall_skips_the_ssh_port

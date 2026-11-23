@@ -241,7 +241,7 @@ page_hardening() {
 
   section "Other options"
   cmd "--report"     "also save the audit report to ~/security-audit/"
-  cmd "--no-audit"   "skip the final report"
+  cmd "--audit"      "print the audit report"
   cmd "--no-restart" "write configs but restart no service"
   cmd "-l, --list"   "list tasks and exit"
 

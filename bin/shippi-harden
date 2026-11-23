@@ -4036,7 +4036,7 @@ audit() {
   {
 
     banner
-    printf '%ssecurity audit%s  %s\n' "$C_GREEN" "$C_OFF" "$(date '+%d/%m/%Y %H:%M %Z')"
+    printf '%s  security audit%s  %s\n' "$C_GREEN" "$C_OFF" "$(date '+%d/%m/%Y %H:%M %Z')"
     printf '  host: %s   os: %s\n' "$(hostname)" "$pretty"
 
     heading "listening ports"

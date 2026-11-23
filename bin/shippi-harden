@@ -127,6 +127,20 @@ heading() {
   printf '\n%s-- %s --%s\n' "$C_GREEN" "$1" "$C_OFF"
 }
 
+# Where to change what the audit just reported. The whole hint is dim so it
+# recedes and the report data stays readable. Taking arbitrary commands means
+# the safer tools (vipw, visudo) can be suggested where nano would be the
+# wrong way to edit the file.
+config_hint() {
+  local dir="$1"
+  shift
+  printf '  %s%s%s\n' "$C_DIM" "cd ${dir}" "$C_OFF"
+  local cmd
+  for cmd in "$@"; do
+    printf '  %s%s%s\n' "$C_DIM" "$cmd" "$C_OFF"
+  done
+}
+
 step() { printf '  %s\n' "$1"; }
 ok() { printf '  %s✓%s %s\n' "$C_RED" "$C_OFF" "$1"; }
 warn() { printf '  %s!%s %s\n' "$C_RED" "$C_OFF" "$1" >&2; }
@@ -4054,6 +4068,7 @@ audit() {
     fi
 
     heading "ufw"
+    config_hint /etc/ufw "sudo nano after.rules"
     if have ufw; then
       peek ufw status verbose 2>/dev/null | sed 's/^/  /' || printf '  unavailable\n'
     else
@@ -4061,6 +4076,7 @@ audit() {
     fi
 
     heading "sshd (effective)"
+    config_hint /etc/ssh "sudo nano sshd_config"
     if line="$(peek sshd -T 2>/dev/null | grep -iE '^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitemptypasswords|maxauthtries|maxsessions|logingracetime|x11forwarding|allowusers|allowtcpforwarding) ' )"; then
       printf '%s\n' "$line" | sed 's/^/  /'
     else
@@ -4068,6 +4084,7 @@ audit() {
     fi
 
     heading "fail2ban"
+    config_hint /etc/fail2ban "sudo nano jail.d/shippi-hardening.local"
     if have fail2ban-client && peek fail2ban-client status &>/dev/null; then
       peek fail2ban-client status 2>/dev/null | sed 's/^/  /'
     else
@@ -4075,6 +4092,9 @@ audit() {
     fi
 
     heading "unattended upgrades"
+    config_hint /etc/apt/apt.conf.d \
+      "sudo nano 51shippi-origins" \
+      "sudo nano 52shippi-unattended-upgrades"
     peek apt-config dump 2>/dev/null |
       grep -E 'Unattended-Upgrade::(Allowed-Origins|Automatic-Reboot|Package-Blacklist)' |
       sed 's/^/  /' || printf '  not configured\n'
@@ -4115,16 +4135,19 @@ audit() {
     heading "system health"
     audit_system_health
 
-    heading "apparmour"
+    heading "apparmor"
+    config_hint /etc/apparmor.d "sudo aa-complain <profile>"
     peek aa-status 2>/dev/null | head -6 | sed 's/^/  /' || printf '  not installed\n'
 
     heading "sysctl"
+    config_hint /etc/sysctl.d "sudo nano 99-shippi-hardening.conf"
     printf '  file: %s\n' "$([[ -f ${CONF_DEST}/etc/sysctl.d/99-shippi-hardening.conf ]] &&
       echo present || echo absent)"
     peek sysctl net.ipv4.conf.all.rp_filter net.ipv4.tcp_syncookies 2>/dev/null |
       sed 's/^/  /' || true
 
     heading "accounts"
+    config_hint /etc "sudo vipw" "sudo visudo"
     printf '  passwordless: %s\n' \
       "$(peek awk -F: '($2 == "") {print $1}' /etc/shadow 2>/dev/null | tr '\n' ' ' || true)"
     printf '  uid 0: %s\n' \
@@ -4134,6 +4157,7 @@ audit() {
       "$(peek getent group sudo 2>/dev/null | cut -d: -f4 || echo '?')"
 
     heading "service minimisation"
+    config_hint /etc/systemd/system "sudo systemctl disable --now <unit>"
     if have systemctl; then
       service_state_summary
     else
@@ -4141,6 +4165,7 @@ audit() {
     fi
 
     heading "recent auth failures"
+    config_hint /etc/fail2ban "sudo nano jail.d/shippi-hardening.local"
     peek journalctl -u ssh --since '-24 hours' --no-pager 2>/dev/null |
       grep -ciE 'failed|invalid|refused' |
       awk '{print "  ssh failures in 24h: " $1}' || true

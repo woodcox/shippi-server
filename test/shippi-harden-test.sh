@@ -3102,8 +3102,10 @@ test_audit_timeout_is_inside_peek() {
   # and peek is a shell function, so it always exited 127 and the audit
   # reported "world-writable files: 0" on a box it never scanned.
   local body rc=0
-  body="$_ORIGINAL_AUDIT"
+  body="$(declare -f world_writable_summary)"
   [[ $body == *"peek timeout 60 find"* ]] || rc=1
+  [[ $body != *"timeout 60 peek"* ]] || rc=1
+  body="$(declare -f audit)"
   [[ $body != *"timeout 60 peek"* ]] || rc=1
   return $rc
 }
@@ -3136,8 +3138,197 @@ test_audit_hints_show_where_to_edit() {
   [[ $body == *'config_hint /etc/ssh'* ]] || rc=1
   [[ $body == *'config_hint /etc/fail2ban'* ]] || rc=1
   [[ $body == *'config_hint /etc/sysctl.d'* ]] || rc=1
+  [[ $body == *'heading "filesystem & storage"'* ]] || rc=1
+  [[ $body != *'disk space on the boot filesystem matters'* ]] || rc=1
   [[ $body == *'heading "apparmor"'* ]] || rc=1
   [[ $body != *'heading "apparmour"'* ]] || rc=1
+  return $rc
+}
+
+test_audit_mount_table_marks_boot_pressure() {
+  setup_destdir
+  local rc=0 out
+  stub storage_mounts
+  storage_mounts() { printf '/\n/boot/firmware\n'; }
+  stub mount_stats
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '510M 67M 444M 13%% vfat 454424\n' ;;
+    esac
+  }
+
+  out="$(audit_mount_table)"
+  assert_contains "$out" "Mount" || rc=1
+  assert_contains "$out" "/boot/firmware   vfat" || rc=1
+  assert_contains "$out" "422G" || rc=1
+  if [[ $out == *WARN* ]]; then
+    printf '        a healthy boot filesystem was marked as pressure\n'
+    rc=1
+  fi
+
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '510M 489M 21M 97%% vfat 21504\n' ;;
+    esac
+  }
+  out="$(audit_mount_table)"
+  assert_contains "$out" "97%" || rc=1
+  assert_contains "$out" "WARN" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_audit_storage_verdict_names_the_consequence() {
+  setup_destdir
+  local rc=0 out
+  stub storage_mounts
+  storage_mounts() { printf '/\n/boot/firmware\n'; }
+  stub mount_stats
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '510M 67M 444M 13%% vfat 454424\n' ;;
+    esac
+  }
+
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "No disk pressure: 422G free on /, 444M free on /boot/firmware" || rc=1
+
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '510M 489M 21M 97%% vfat 21504\n' ;;
+    esac
+  }
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "WARN: /boot/firmware has 21M free (97% used)" || rc=1
+  assert_contains "$out" "kernel package needs about 25M" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_boot_kernel_summary_counts_versions_and_images() {
+  setup_destdir
+  local rc=0 t out
+  t="$(mktemp -d)"
+  : >"$t/vmlinuz-6.12.109+rpt-rpi-2712"
+  : >"$t/vmlinuz-6.12.109+rpt-rpi-v8"
+  : >"$t/vmlinuz-6.12.115+rpt-rpi-2712"
+  : >"$t/vmlinuz-6.12.115+rpt-rpi-v8"
+  : >"$t/initrd.img-6.12.109+rpt-rpi-2712"
+  : >"$t/initrd.img-6.12.109+rpt-rpi-v8"
+  : >"$t/initrd.img-6.12.115+rpt-rpi-2712"
+  : >"$t/initrd.img-6.12.115+rpt-rpi-v8"
+
+  out="$(SHIPPI_BOOT_DIR="$t" boot_kernel_summary)"
+  assert_contains "$out" "2 versions, 4 images" || rc=1
+  assert_contains "$out" "in $t" || rc=1
+
+  rm -rf "$t"
+  t="$(mktemp -d)"
+  out="$(SHIPPI_BOOT_DIR="$t" boot_kernel_summary)"
+  assert_contains "$out" "none in $t" || rc=1
+  rm -rf "$t"
+  teardown_destdir
+  return $rc
+}
+
+test_inode_summary_uses_root_filesystem() {
+  setup_destdir
+  local rc=0 out
+  stub df
+  df() { printf 'ITOTAL IUSED IPCT\n30313024 715529 3%%\n'; }
+  out="$(inode_summary)"
+  assert_eq "$out" "/  3% used (716k of 30.3M)" || rc=1
+
+  df() { return 1; }
+  out="$(inode_summary)"
+  assert_eq "$out" "unavailable" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_journal_summary_reports_cap() {
+  setup_destdir
+  local rc=0 out
+  stub journalctl
+  journalctl() { printf 'Archived and active journals take up 139.6M in the file system.\n'; }
+  stub journal_max_use
+  journal_max_use() { printf '200M\n'; }
+  out="$(journal_summary)"
+  assert_eq "$out" "139.6M of 200M cap (70%)" || rc=1
+
+  journal_max_use() { return 0; }
+  out="$(journal_summary)"
+  assert_eq "$out" "139.6M (no explicit cap)" || rc=1
+
+  journalctl() { return 1; }
+  out="$(journal_summary)"
+  assert_eq "$out" "unavailable" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_apt_cache_summary_reports_reclaimable() {
+  setup_destdir
+  local rc=0 t out
+  t="$(mktemp -d)"
+  printf 'package' >"$t/pkg.deb"
+  out="$(SHIPPI_APT_CACHE_DIR="$t" apt_cache_summary)"
+  assert_contains "$out" "reclaimable" || rc=1
+  rm -rf "$t"
+
+  out="$(SHIPPI_APT_CACHE_DIR="$t" apt_cache_summary)"
+  assert_eq "$out" "none" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_docker_disk_summary_separates_logical_and_on_disk() {
+  setup_destdir
+  local rc=0 out
+  stub docker_present
+  docker_present() { return 0; }
+  stub docker
+  docker() {
+    case "$*" in
+      info*) printf '/var/lib/docker\n' ;;
+      system\ df*) printf 'Images\t7.093GB\t5.039GB (71%%)\nContainers\t102.4kB\t0B (0%%)\n' ;;
+    esac
+  }
+  stub peek
+  peek() { printf '1.5G\t/var/lib/docker\n'; }
+
+  out="$(docker_disk_summary)"
+  assert_eq "$out" "1.5G on disk, 7.093GB logical images (5.039GB reclaimable)" || rc=1
+
+  docker_present() { return 1; }
+  out="$(docker_disk_summary)"
+  assert_eq "$out" "not running" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_world_writable_summary_excludes_user_caches() {
+  setup_destdir
+  local rc=0 out
+  stub peek
+  peek() {
+    printf '%s\n' \
+      /home/woodcox/.cache/uv/a.lock \
+      /home/woodcox/.hermes/cache/uv/b.lock \
+      /tmp/c \
+      /usr/local/bin/bad
+  }
+  out="$(world_writable_summary)"
+  assert_eq "$out" "4 total, 1 outside home/cache/tmp: /usr/local/bin/bad" || rc=1
+
+  peek() { return 124; }
+  out="$(world_writable_summary)"
+  assert_eq "$out" "not scanned (needs root or timed out)" || rc=1
+  teardown_destdir
   return $rc
 }
 
@@ -4806,6 +4997,14 @@ t 'newest installed kernel is version-sorted'           test_newest_installed_ke
 t 'failed units returns unit names only'                test_failed_systemd_units_returns_unit_names
 t 'audit timeout is inside peek'                        test_audit_timeout_is_inside_peek
 t 'audit hints point at config files'                   test_audit_hints_show_where_to_edit
+t 'storage table flags a full boot filesystem'          test_audit_mount_table_marks_boot_pressure
+t 'storage verdict explains boot pressure'              test_audit_storage_verdict_names_the_consequence
+t 'storage counts kernel versions and images'           test_boot_kernel_summary_counts_versions_and_images
+t 'storage reports inode use for /'                     test_inode_summary_uses_root_filesystem
+t 'storage reports journal size against its cap'        test_journal_summary_reports_cap
+t 'storage reports reclaimable apt cache'               test_apt_cache_summary_reports_reclaimable
+t 'storage separates docker logical and on-disk'        test_docker_disk_summary_separates_logical_and_on_disk
+t 'storage filters world-writable cache noise'          test_world_writable_summary_excludes_user_caches
 t 'audit is offered after the run'                      test_audit_prompt_offered_after_main_output
 t 'declining the audit runs nothing'                    test_audit_prompt_declined_runs_nothing
 t '--audit and --yes skip the audit prompt'             test_audit_flag_and_yes_skip_the_prompt

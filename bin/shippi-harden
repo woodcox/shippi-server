@@ -3982,6 +3982,335 @@ newest_installed_kernel() {
   printf '%s\n' "${candidates[@]}" | sort -V | tail -1
 }
 
+# ---------------------------------------------------------------------------
+# filesystem & storage
+# ---------------------------------------------------------------------------
+# A full /boot partition is the classic Pi way to stop receiving kernel
+# security patches: apt cannot unpack the new image, the box keeps booting the
+# old kernel, and nothing else reports it. The threshold is about the next
+# update fitting, not a round percentage, so the table and the verdict use the
+# same number.
+BOOT_MIN_FREE_KB=102400
+
+# True when $1 is a mountpoint in its own right. /boot is a directory on / on
+# a Pi 5 (Bookworm moved the firmware to /boot/firmware), but it is the vfat
+# boot partition itself on older layouts. Both need looking at; a path
+# existing is not enough to tell which one this is.
+is_mountpoint() {
+  [[ -d $1 ]] || return 1
+  [[ $(LC_ALL=C df --output=target -- "$1" 2>/dev/null | tail -1) == "$1" ]]
+}
+
+# Mounts whose free space can break the box. /boot/firmware only exists on
+# layouts that have it; /boot is included only when it is separate.
+storage_mounts() {
+  local m
+  printf '/\n'
+  for m in /boot /boot/firmware; do
+    if is_mountpoint "$m"; then
+      printf '%s\n' "$m"
+    fi
+  done
+}
+
+# "size used avail pcent fstype avail_kb" for one mount, or non-zero when df
+# cannot answer. One line, so callers can consume it with `read`.
+mount_stats() {
+  local m="$1" row avail_kb
+  row="$(LC_ALL=C df -h --output=size,used,avail,pcent,fstype -- "$m" 2>/dev/null | tail -1)" || return 1
+  [[ -n $row ]] || return 1
+  avail_kb="$(LC_ALL=C df --output=avail -- "$m" 2>/dev/null | tail -1 || true)"
+  printf '%s %s\n' "$row" "${avail_kb:-0}"
+}
+
+# True when a mount deserves a WARN. Every mount gets the 90% rule; the boot
+# mounts also get the absolute floor, because 90% of a 510M partition is
+# still 51M free, which is not enough for a kernel package.
+disk_mount_warn() {
+  local m="$1" pcent="${2%\%}" avail_kb="$3"
+  if [[ $pcent =~ ^[0-9]+$ ]] && ((pcent >= 90)); then
+    return 0
+  fi
+  if [[ $m != / && $avail_kb =~ ^[0-9]+$ ]] && ((avail_kb < BOOT_MIN_FREE_KB)); then
+    return 0
+  fi
+  return 1
+}
+
+audit_mount_table() {
+  local m stats size used avail pcent fstype avail_kb mark
+  printf '  %-16s %-5s %5s %5s %6s %5s\n' Mount Type Size Used Avail Use%
+  while IFS= read -r m; do
+    if ! stats="$(mount_stats "$m")"; then
+      printf '  %-16s unavailable\n' "$m"
+      continue
+    fi
+    read -r size used avail pcent fstype avail_kb <<<"$stats"
+    mark=""
+    if disk_mount_warn "$m" "$pcent" "$avail_kb"; then
+      mark="  WARN"
+    fi
+    printf '  %-16s %-5s %5s %5s %6s %5s%s\n' \
+      "$m" "$fstype" "$size" "$used" "$avail" "$pcent" "$mark"
+  done < <(storage_mounts)
+}
+
+# Counts for humans: 715529 -> 716k, 30313024 -> 30.3M.
+human_count() {
+  awk -v n="$1" 'BEGIN {
+    if (n >= 1000000000) printf "%.1fB", n / 1000000000
+    else if (n >= 1000000) printf "%.1fM", n / 1000000
+    else if (n >= 1000) printf "%.0fk", n / 1000
+    else printf "%d", n
+  }'
+}
+
+inode_summary() {
+  local row total used pcent
+  row="$(LC_ALL=C df --output=itotal,iused,ipcent -- / 2>/dev/null | tail -1 || true)"
+  read -r total used pcent <<<"$row"
+  if [[ ! $total =~ ^[0-9]+$ || ! $used =~ ^[0-9]+$ || ! $pcent =~ ^[0-9]+%$ ]]; then
+    printf 'unavailable\n'
+    return 0
+  fi
+  printf '/  %s used (%s of %s)\n' \
+    "$pcent" "$(human_count "$used")" "$(human_count "$total")"
+}
+
+# Journald sizes are printed as 139.6M, 1.2G, ... Convert to KiB so the
+# percentage against the cap is computed in one unit.
+size_to_kb() {
+  awk -v s="$1" 'BEGIN {
+    if (s !~ /^[0-9.]+[KMGTP]?$/) exit 1
+    unit = substr(s, length(s), 1)
+    n = s
+    if (unit ~ /[KMGTP]/) sub(/[KMGTP]$/, "", n)
+    mult = 1
+    if (unit == "M") mult = 1024
+    else if (unit == "G") mult = 1048576
+    else if (unit == "T") mult = 1073741824
+    else if (unit == "P") mult = 1099511627776
+    printf "%d", n * mult
+  }'
+}
+
+# cat-config merges the main file and every drop-in in precedence order, so
+# the last uncommented SystemMaxUse= is the effective one. `systemctl show`
+# does not expose this setting.
+journal_max_use() {
+  systemd-analyze cat-config systemd/journald.conf 2>/dev/null |
+    sed -n 's/^SystemMaxUse=//p' | tail -1
+}
+
+journal_summary() {
+  local used cap used_kb cap_kb pct
+  used="$(journalctl --disk-usage 2>/dev/null |
+    sed -n 's/.*take up \([0-9.]\+[KMGTP]\?\).*/\1/p' | tail -1 || true)"
+  if [[ -z $used ]]; then
+    printf 'unavailable\n'
+    return 0
+  fi
+  cap="$(journal_max_use || true)"
+  if [[ -z $cap ]]; then
+    printf '%s (no explicit cap)\n' "$used"
+    return 0
+  fi
+  used_kb="$(size_to_kb "$used" || true)"
+  cap_kb="$(size_to_kb "$cap" || true)"
+  if [[ $used_kb =~ ^[0-9]+$ && $cap_kb =~ ^[0-9]+$ ]] && ((cap_kb > 0)); then
+    pct=$(((used_kb * 100 + cap_kb / 2) / cap_kb))
+    printf '%s of %s cap (%s%%)\n' "$used" "$cap" "$pct"
+  else
+    printf '%s (cap %s)\n' "$used" "$cap"
+  fi
+}
+
+apt_cache_summary() {
+  local dir="${SHIPPI_APT_CACHE_DIR:-/var/cache/apt/archives}" size
+  if [[ ! -d $dir ]]; then
+    printf 'none\n'
+    return 0
+  fi
+  size="$(du -sh "$dir" 2>/dev/null | cut -f1 || true)"
+  if [[ -z $size ]]; then
+    printf 'unavailable\n'
+  else
+    printf '%s reclaimable\n' "$size"
+  fi
+}
+
+# `docker system df` sizes are logical and count shared layers per image, so
+# they can be several times the blocks the directory occupies. Both numbers
+# are useful, for different questions, hence both on the line.
+docker_disk_summary() {
+  if ! docker_present; then
+    printf 'not running\n'
+    return 0
+  fi
+
+  local root on_disk images="" summary
+  root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+  [[ -n $root ]] || root=/var/lib/docker
+  on_disk="$(peek du -sh "$root" 2>/dev/null | cut -f1 || true)"
+  [[ -n $on_disk ]] || on_disk="on-disk size unavailable (needs root)"
+
+  if summary="$(docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null)"; then
+    images="$(printf '%s\n' "$summary" | awk -F'\t' '
+      $1 == "Images" {
+        reclaim = $3
+        sub(/ *\([^)]*\)[[:space:]]*$/, "", reclaim)
+        printf "%s logical images (%s reclaimable)", $2, reclaim
+        found = 1
+        exit
+      }
+      END { if (!found) exit 1 }
+    ')" || images=""
+  fi
+
+  if [[ -n $images ]]; then
+    printf '%s on disk, %s\n' "$on_disk" "$images"
+  else
+    printf '%s on disk, logical usage unavailable\n' "$on_disk"
+  fi
+}
+
+# Kernel versions and images apt has left in /boot. The mount table cannot
+# show this on a Pi 5, where /boot is on / and only /boot/firmware is a
+# separate filesystem, so space pressure from old kernels would otherwise be
+# invisible. `images` counts vmlinuz files; the size includes initrds too.
+boot_kernel_summary() {
+  local boot="${SHIPPI_BOOT_DIR:-/boot}"
+  local -a kernels=()
+  local -A versions=()
+  local f files size rel base flavor where=""
+
+  if [[ ! -d $boot ]]; then
+    printf 'unavailable (no %s)\n' "$boot"
+    return 0
+  fi
+
+  while IFS= read -r f; do
+    kernels+=("$f")
+  done < <(find "$boot" -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null | sort)
+
+  files="$(find "$boot" -maxdepth 1 -type f \
+    \( -name 'vmlinuz-*' -o -name 'initrd.img-*' \) -printf 'x\n' 2>/dev/null |
+    wc -l || true)"
+  if ((files == 0)); then
+    printf 'none in %s\n' "$boot"
+    return 0
+  fi
+
+  size="$(find "$boot" -maxdepth 1 -type f \
+    \( -name 'vmlinuz-*' -o -name 'initrd.img-*' \) -exec du -ch {} + 2>/dev/null |
+    tail -1 | cut -f1 || true)"
+  for f in "${kernels[@]}"; do
+    rel="${f#vmlinuz-}"
+    flavor="$(kernel_flavor "$rel")"
+    base="$rel"
+    if [[ -n $flavor && $rel == *"$flavor" ]]; then
+      base="${rel%"$flavor"}"
+      base="${base%[+-]}"
+    fi
+    versions["$base"]=1
+  done
+
+  is_mountpoint "$boot" || where=" (on /)"
+  printf '%s versions, %s images, %s in %s%s\n' \
+    "${#versions[@]}" "${#kernels[@]}" "${size:-?}" "$boot" "$where"
+}
+
+# World-writable files in a package cache or a user's home are noise: uv's
+# lock files are deliberately 0666 and there are hundreds of them. Count them
+# so the total matches find, but report the number outside those trees, which
+# is the part that can be acted on.
+world_writable_is_noise() {
+  case "$1" in
+    /home/*|/root/*|/tmp/*|/var/tmp/*|/dev/shm/*|/var/cache/*|/var/lib/docker/*|/var/lib/containerd/*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+world_writable_summary() {
+  local tmp total=0 f
+  local -a outside=()
+  tmp="$(mktemp "${TMPDIR:-/tmp}/shippi-ww.XXXXXX")" || {
+    printf 'unavailable (could not create a temp file)\n'
+    return 0
+  }
+  # A timeout leaves a partial list, and a partial count is worse than an
+  # explicit "not scanned": the old pipeline printed wc's 0 when find never
+  # ran, which read as a clean bill of health on a box that was never scanned.
+  if ! peek timeout 60 find / -xdev -type f -perm -002 2>/dev/null >"$tmp"; then
+    rm -f "$tmp"
+    printf 'not scanned (needs root or timed out)\n'
+    return 0
+  fi
+  while IFS= read -r f; do
+    total=$((total + 1))
+    if ! world_writable_is_noise "$f"; then
+      outside+=("$f")
+    fi
+  done <"$tmp"
+  rm -f "$tmp"
+
+  if ((${#outside[@]} == 0)); then
+    printf '%s total, 0 outside home/cache/tmp\n' "$total"
+  else
+    local IFS=' '
+    printf '%s total, %s outside home/cache/tmp: %s\n' \
+      "$total" "${#outside[@]}" "${outside[*]:0:3}"
+  fi
+}
+
+# The closing line used to be an unexplained claim. Derive it from the same
+# numbers the table printed, so a healthy box says so and a full one names
+# the mount and the consequence.
+mount_pressure_summary() {
+  local m stats size used avail pcent fstype avail_kb boot_warn=0 w
+  local -a free=() warnings=()
+  while IFS= read -r m; do
+    stats="$(mount_stats "$m")" || continue
+    read -r size used avail pcent fstype avail_kb <<<"$stats"
+    free+=("${avail} free on ${m}")
+    if disk_mount_warn "$m" "$pcent" "$avail_kb"; then
+      warnings+=("${m} has ${avail} free (${pcent} used)")
+      [[ $m == / ]] || boot_warn=1
+    fi
+  done < <(storage_mounts)
+
+  printf '\n'
+  if ((${#warnings[@]})); then
+    for w in "${warnings[@]}"; do
+      printf '  WARN: %s\n' "$w"
+    done
+    if ((boot_warn)); then
+      printf '  A kernel package needs about 25M, so apt will fail the kernel\n'
+      printf '  step, keep the old kernel, and silently stop receiving fixes.\n'
+    fi
+  else
+    local free_text=""
+    for w in "${free[@]}"; do
+      free_text+="${free_text:+, }$w"
+    done
+    printf '  No disk pressure: %s.\n' "$free_text"
+  fi
+}
+
+audit_storage() {
+  audit_mount_table
+  printf '\n'
+  printf '  %-14s %s\n' kernels "$(boot_kernel_summary)"
+  printf '  %-14s %s\n' inodes "$(inode_summary)"
+  printf '  %-14s %s\n' journal "$(journal_summary)"
+  printf '  %-14s %s\n' "apt cache" "$(apt_cache_summary)"
+  printf '  %-14s %s\n' docker "$(docker_disk_summary)"
+  printf '  %-14s %s\n' "world-writable" "$(world_writable_summary)"
+  mount_pressure_summary
+}
+
 audit_system_health() {
   local failed newest krel
   krel="$(uname -r 2>/dev/null || printf '?')"
@@ -4171,16 +4500,8 @@ audit() {
       grep -ciE 'failed|invalid|refused' |
       awk '{print "  ssh failures in 24h: " $1}' || true
 
-    heading "filesystem"
-    printf '  %s\n' "$(peek df -h / 2>/dev/null | tail -1 || true)"
-    # timeout must go inside peek, not around it: timeout execs an external
-    # program and cannot run a shell function, so `timeout 60 peek find ...`
-    # always failed with exit 127 and the audit reported "world-writable
-    # files: 0" on a box it never actually scanned.
-    printf '  world-writable files: %s\n' \
-      "$(peek timeout 60 find / -xdev -type f -perm -002 2>/dev/null | wc -l || echo 'not scanned')"
-
-    printf '\n disk space on the boot filesystem matters \n'
+    heading "filesystem & storage"
+    audit_storage
   } 2>&1 | tee "$AUDIT_TMP"
 
   if ((WANT_REPORT)); then

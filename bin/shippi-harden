@@ -178,7 +178,7 @@ Options:
                         interface, plus tailscale0; by default SSH is never
                         opened to 0.0.0.0/0.
       --report       also save the audit report to ~/security-audit/
-      --no-audit     skip the final report
+      --audit        print the audit report
       --no-restart   write configs but do not restart any service
   -l, --list        list tasks and exit
   -h, --help        this text

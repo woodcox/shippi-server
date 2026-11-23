@@ -81,6 +81,23 @@ DEFAULT_TASKS=(packages users accounts services ssh firewall fail2ban updates ap
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
+
+# Banner
+banner() {
+  local CYAN=$'\e[36m'
+  local RESET=$'\e[0m'
+  local -a art=(
+      '  ┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻'
+      '  ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
+      '  ┗━┛ ╹ ╹ ╹ ╹   ╹   ╹'
+      '    ─ s e r v e r ─'
+  )
+
+  printf '\n%b' "${CYAN}"
+  printf '%s\n' "${art[@]}"
+  printf '%b\n\n' "${RESET}"
+}
+
 # Section headings
 # Only use colors when stdout is a terminal and NO_COLOR isn't set
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -4017,8 +4034,10 @@ audit() {
   fi
 
   {
-    printf 'shippi security audit - %s\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
-    printf 'host: %s   os: %s\n' "$(hostname)" "$pretty"
+
+    banner
+    printf '%s%s  security audit%s\n' "$C_GREEN" "$(date -u '+%Y-%m-%d %H:%M UTC')" "$C_OFF"
+    printf '  host: %s   os: %s\n' "$(hostname)" "$pretty"
 
     heading "listening ports"
     # Compared against the unique list, not the raw per-line output: a port
@@ -4135,7 +4154,7 @@ audit() {
     printf '  world-writable files: %s\n' \
       "$(peek timeout 60 find / -xdev -type f -perm -002 2>/dev/null | wc -l || echo 'not scanned')"
 
-    printf '\n-- disk space on the boot filesystem matters more than any of the above --\n'
+    printf '\n disk space on the boot filesystem matters \n'
   } 2>&1 | tee "$AUDIT_TMP"
 
   if ((WANT_REPORT)); then
@@ -4203,21 +4222,6 @@ known_task() {
     [[ $k == "$t" ]] && return 0
   done
   return 1
-}
-
-banner() {
-  local CYAN=$'\e[36m'
-  local RESET=$'\e[0m'
-  local -a art=(
-      '  ┏━┓ ╻ ╻ ╻ ┏━┓ ┏━┓ ╻'
-      '  ┗━┓ ┣━┫ ┃ ┣━┛ ┣━┛ ┃'
-      '  ┗━┛ ╹ ╹ ╹ ╹   ╹   ╹'
-      '    ─ s e r v e r ─'
-  )
-
-  printf '\n%b' "${CYAN}"
-  printf '%s\n' "${art[@]}"
-  printf '%b\n\n' "${RESET}"
 }
 
 main() {

@@ -49,7 +49,7 @@ AGENT_FORWARDING=0
 # an ssh password opts in with --password-ssh.
 PASSWORD_SSH=0
 WANT_REPORT=0
-RUN_AUDIT=1
+RUN_AUDIT=0
 NO_RESTART=0
 # Test-only override so the config writers can be exercised against a
 # throwaway tree instead of the live system. Unset in normal use.
@@ -4242,7 +4242,7 @@ main() {
         shift
         ;;
       --report) WANT_REPORT=1 ;;
-      --no-audit) RUN_AUDIT=0 ;;
+      --audit) RUN_AUDIT=1 ;;
       --no-restart) NO_RESTART=1 ;;
       -l | --list) list_tasks; return 0 ;;
       -h | --help) usage; return 0 ;;

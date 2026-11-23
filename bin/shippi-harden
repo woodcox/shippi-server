@@ -138,8 +138,8 @@ config_hint() {
   local cmd
   for cmd in "$@"; do
     printf '  %s%s%s\n' "$C_DIM" "$cmd" "$C_OFF"
-    echo ""
   done
+  echo ""
 }
 
 step() { printf '  %s\n' "$1"; }

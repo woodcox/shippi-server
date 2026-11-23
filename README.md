@@ -64,7 +64,7 @@ Shippi-server provides:
  - `shippi-setup`: Git name and email and github cli
  - `shippi-refresh`: Reinstall Shippi with initial configs
  - `shippi-ssh`: Add SSH key for remote access
- - `shippi-harden`: One-time security hardening — run `shippi-harden --dry-run` first. See security hardening section for further details
+ - `shippi-harden`: One-time security hardening — run `shippi-harden`; it asks for sudo once. Use `--dry-run` first to see the plan. See the security hardening section for further details
 
  - [opencode](https://opencode.ai/): alias `oc`
  - Claude: alias `cc=printf "\033[2J\033[3J\033[H" && claude --permission-mode bypassPermissions`
@@ -154,22 +154,26 @@ exact `systemctl enable --now` command to undo it.
 
 File-integrity monitoring (aide) is opt-in — ask for it by name, since building the baseline reads the whole
 filesystem. Add `--report` to save the resulting audit to `~/security-audit/`.
-The final audit also reports failed systemd units, whether a reboot is pending
+The audit is skipped by default and offered again at the end of a run; `--audit`
+runs it directly. It reports failed systemd units, whether a reboot is pending
 (with the packages that requested it), and whether the running kernel is the
 newest one installed — the three checks that matter most on a headless box
 after an update.
 
-Run it under `sudo`, with the full path as the validator also needs
-root to read `/etc/ufw/after.rules` (`0640 root:root`); without it the
-`DOCKER-USER` rules are reported as unverified rather than checked.
+Run `shippi-harden` normally. It asks for sudo once and caches the credential
+for the privileged steps, so prefixing it with `sudo` is optional. It needs root
+to read `/etc/ufw/after.rules` (`0640 root:root`); without it the `DOCKER-USER`
+rules are reported as unverified rather than checked.
 
 ```bash
 
-sudo $HOME/.local/bin/shippi-harden --list       # available tasks
-sudo $HOME/.local/bin/shippi-harden ssh firewall  # just these two
-sudo $HOME/.local/bin/shippi-harden --yes         # take the recommended defaults
-sudo $HOME/.local/bin/shippi-harden --ssh-from 192.168.1.0/24 firewall
-./test/shippi-harden-test.sh              # test suite does not need root access
+shippi-harden                                     # apply the defaults; asks for sudo once
+shippi-harden --list                              # available tasks
+shippi-harden --dry-run                           # print the plan, change nothing
+shippi-harden ssh firewall                        # just these two
+shippi-harden --yes                               # recommended defaults, no hardening prompts
+shippi-harden --ssh-from 192.168.1.0/24 firewall
+./test/shippi-harden-test.sh                      # test suite does not need root access
 ```
 
 If you would rather do it by hand, please see the three hardening guides below:
@@ -252,7 +256,7 @@ Some deliberate choices worth knowing before you run it:
   those unattended is how a working stack dies at 3am, and they are not where
   this box's kernel-level exposure lives. Anything `apt upgrade` defers because
   it needs a new dependency is named out loud, because that class of hold is
-  silent by nature. The audit that runs by default also flags a kernel image
+  silent by nature. The audit also flags a kernel image
   in `/boot` that no package owns — the signature of `rpi-update`, which
   installs a kernel outside
   apt's management so it quietly stops receiving patches. That check is scoped

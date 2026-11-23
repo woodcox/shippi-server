@@ -68,7 +68,7 @@ page_commands() {
   cmd "shippi-refresh" "Reinstall Shippi with initial configs"
   cmd "shippi-setup"   "Set git name, email and GitHub CLI auth"
   cmd "shippi-ssh"     "Add SSH key for remote access"
-  cmd "shippi-harden"  "Run the security hardening tool (try --dry-run first)"
+  cmd "shippi-harden"  "Run the security hardening tool (asks for sudo; try --dry-run first)"
 
   section "AI Tools"
   cmd "oc"  "opencode"
@@ -210,13 +210,14 @@ page_hardening() {
   clear
   echo ""
   header "Security Hardening (shippi-harden)"
-  echo -e "  ${DIM}Run under sudo. Read the full detail in the repo README.${RESET}"
+  echo -e "  ${DIM}Run shippi-harden; it asks for sudo once and caches it. Read the full detail in the repo README.${RESET}"
 
-  section "Try it before it changes anything"
-  cmd '$HOME/.local/bin/shippi-harden --list'       "List tasks and exit"
-  cmd 'sudo $HOME/.local/bin/shippi-harden --dry-run' "Print the plan, change nothing"
-  cmd 'sudo $HOME/.local/bin/shippi-harden --yes'     "Take recommended defaults, no prompts"
-  cmd 'sudo $HOME/.local/bin/shippi-harden ssh firewall' "Just named tasks"
+  section "Run it"
+  cmd 'shippi-harden'                 "Apply the recommended defaults (asks for sudo once)"
+  cmd 'shippi-harden --list'          "List tasks and exit"
+  cmd 'shippi-harden --dry-run'       "Print the plan, change nothing"
+  cmd 'shippi-harden --yes'           "Take recommended defaults, no hardening prompts"
+  cmd 'shippi-harden ssh firewall'    "Just named tasks"
 
   section "Tasks (default: all but aide)"
   cmd "packages"   "hardening tooling: ufw, fail2ban, apparmor, ..."
@@ -241,13 +242,14 @@ page_hardening() {
 
   section "Other options"
   cmd "--report"     "also save the audit report to ~/security-audit/"
-  cmd "--audit"      "print the audit report"
+  cmd "--audit"      "run the audit without the end-of-run prompt"
   cmd "--no-restart" "write configs but restart no service"
   cmd "-l, --list"   "list tasks and exit"
+  echo -e "  ${DIM}  The audit is skipped by default and offered again at the end of the run.${RESET}"
 
   section "LAN-only box with password login"
-  cmd 'sudo $HOME/.local/bin/shippi-harden --password-ssh --dry-run' "then, if it looks right:"
-  cmd 'sudo $HOME/.local/bin/shippi-harden --password-ssh --yes'     "prompts default sensibly"
+  cmd 'shippi-harden --password-ssh --dry-run' "then, if it looks right:"
+  cmd 'shippi-harden --password-ssh --yes'     "prompts default sensibly"
   echo -e "  ${DIM}  Passwords are quality-checked but do not expire on a timer.${RESET}"
 }
 

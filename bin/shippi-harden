@@ -178,7 +178,7 @@ Options:
                         interface, plus tailscale0; by default SSH is never
                         opened to 0.0.0.0/0.
       --report       also save the audit report to ~/security-audit/
-      --audit        print the audit report
+      --audit        run the audit without the end-of-run prompt
       --no-restart   write configs but do not restart any service
   -l, --list        list tasks and exit
   -h, --help        this text
@@ -4306,6 +4306,16 @@ main() {
 
   if ((DRY_RUN)); then
     printf '\n%s   dry run. Re-run without --dry-run when this looks right.%s\n' "$C_DIM" "$C_OFF"
+  fi
+
+  # The audit is read-only and immediately useful after a hardening run, but
+  # RUN_AUDIT=0 keeps it out of the default path. Offer it at the end instead
+  # of making the user re-run with --audit. --yes and --dry-run stay
+  # noninteractive, and a task list that leaves audit out is honoured.
+  if want_task audit && ((!RUN_AUDIT)) && ((!DRY_RUN)) && ((!ASSUME_YES)); then
+    if ask "run the security audit now?" n; then
+      audit
+    fi
   fi
 }
 

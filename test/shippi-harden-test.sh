@@ -3314,6 +3314,11 @@ test_journal_summary_reports_cap() {
   out="$(journal_summary)"
   assert_eq "$out" "100M of 209715200 cap (50%)" || rc=1
 
+  # A leading zero must not turn the byte count into an octal number.
+  journal_max_use() { printf '0209715200\n'; }
+  out="$(journal_summary)"
+  assert_eq "$out" "100M of 0209715200 cap (50%)" || rc=1
+
   journal_max_use() { return 0; }
   out="$(journal_summary)"
   assert_eq "$out" "100M (no explicit cap)" || rc=1

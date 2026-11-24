@@ -4126,7 +4126,7 @@ journal_summary() {
   # journald.conf accepts a bare byte count for SystemMaxUse. journalctl
   # always prints a unit for usage, so only the cap needs the byte path.
   if [[ $cap =~ ^[0-9]+$ ]]; then
-    cap_kb=$((cap / 1024))
+    cap_kb=$((10#$cap / 1024))
   else
     cap_kb="$(size_to_kb "$cap" || true)"
   fi

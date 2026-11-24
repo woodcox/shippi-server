@@ -4033,9 +4033,14 @@ mount_stats() {
   # -k pins the unit: DF_BLOCK_SIZE/BLOCK_SIZE would otherwise change the
   # number this returns, and disk_mount_warn compares it with KiB. A failed
   # or non-numeric query must not look like zero free space, or the report
-  # invents disk pressure that was never measured.
+  # invents disk pressure that was never measured. df right-aligns the
+  # column, so trim its padding before validating.
   avail_kb="$(LC_ALL=C df -k --output=avail -- "$m" 2>/dev/null | tail -1)" || return 1
-  [[ $avail_kb =~ ^[0-9]+$ ]] || return 1
+  if [[ $avail_kb =~ ^[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+    avail_kb="${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
   printf '%s %s\n' "$row" "$avail_kb"
 }
 

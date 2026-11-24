@@ -3354,6 +3354,23 @@ test_mount_stats_forces_kib() {
   return $rc
 }
 
+test_mount_stats_trims_df_padding() {
+  setup_destdir
+  local rc=0 out
+  stub df
+  df() {
+    case "$*" in
+      *-k*--output=avail*) printf 'AVAIL\n 4096\n' ;;
+      *--output=size*) printf '470G 24G 422G 6%% ext4\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  out="$(mount_stats /)"
+  assert_eq "${out##* }" "4096" || rc=1
+  teardown_destdir
+  return $rc
+}
+
 test_mount_stats_rejects_failed_numeric_query() {
   setup_destdir
   local rc=0 out
@@ -5179,6 +5196,7 @@ t 'storage verdict separates floor from percentage'     test_audit_storage_verdi
 t 'storage counts kernel versions and images'           test_boot_kernel_summary_counts_versions_and_images
 t 'storage reports inode use for /'                     test_inode_summary_uses_root_filesystem
 t 'storage forces KiB for pressure checks'              test_mount_stats_forces_kib
+t 'storage trims df column padding'                     test_mount_stats_trims_df_padding
 t 'storage rejects a failed numeric df query'           test_mount_stats_rejects_failed_numeric_query
 t 'storage reports journal size against its cap'        test_journal_summary_reports_cap
 t 'journal cap accepts spaces around equals'            test_journal_max_use_accepts_spaced_assignment

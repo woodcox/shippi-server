@@ -3294,6 +3294,34 @@ test_mount_stats_forces_kib() {
   return $rc
 }
 
+test_mount_stats_rejects_failed_numeric_query() {
+  setup_destdir
+  local rc=0 out
+  stub df
+  df() {
+    case "$*" in
+      *-k*--output=avail*) return 1 ;;
+      *--output=size*) printf '470G 24G 422G 6%% ext4\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  if out="$(mount_stats /)"; then rc=1; fi
+  assert_eq "$out" "" || rc=1
+
+  # A successful but empty numeric query must fail the same way.
+  df() {
+    case "$*" in
+      *-k*--output=avail*) return 0 ;;
+      *--output=size*) printf '470G 24G 422G 6%% ext4\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  if out="$(mount_stats /)"; then rc=1; fi
+  assert_eq "$out" "" || rc=1
+  teardown_destdir
+  return $rc
+}
+
 test_journal_summary_reports_cap() {
   setup_destdir
   local rc=0 out
@@ -5088,6 +5116,7 @@ t 'storage verdict explains boot pressure'              test_audit_storage_verdi
 t 'storage counts kernel versions and images'           test_boot_kernel_summary_counts_versions_and_images
 t 'storage reports inode use for /'                     test_inode_summary_uses_root_filesystem
 t 'storage forces KiB for pressure checks'              test_mount_stats_forces_kib
+t 'storage rejects a failed numeric df query'           test_mount_stats_rejects_failed_numeric_query
 t 'storage reports journal size against its cap'        test_journal_summary_reports_cap
 t 'journal cap accepts spaces around equals'            test_journal_max_use_accepts_spaced_assignment
 t 'storage reports reclaimable apt cache'               test_apt_cache_summary_reports_reclaimable

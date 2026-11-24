@@ -4020,9 +4020,12 @@ mount_stats() {
   row="$(LC_ALL=C df -h --output=size,used,avail,pcent,fstype -- "$m" 2>/dev/null | tail -1)" || return 1
   [[ -n $row ]] || return 1
   # -k pins the unit: DF_BLOCK_SIZE/BLOCK_SIZE would otherwise change the
-  # number this returns, and disk_mount_warn compares it with KiB.
-  avail_kb="$(LC_ALL=C df -k --output=avail -- "$m" 2>/dev/null | tail -1 || true)"
-  printf '%s %s\n' "$row" "${avail_kb:-0}"
+  # number this returns, and disk_mount_warn compares it with KiB. A failed
+  # or non-numeric query must not look like zero free space, or the report
+  # invents disk pressure that was never measured.
+  avail_kb="$(LC_ALL=C df -k --output=avail -- "$m" 2>/dev/null | tail -1)" || return 1
+  [[ $avail_kb =~ ^[0-9]+$ ]] || return 1
+  printf '%s %s\n' "$row" "$avail_kb"
 }
 
 # True when a mount deserves a WARN. Every mount gets the 90% rule; the boot

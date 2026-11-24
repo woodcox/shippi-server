@@ -62,34 +62,34 @@ size_to_kb() {
 }
 
 # cat-config merges the main file and every drop-in in precedence order, so
-# the last uncommented SystemMaxUse= is the effective one. `systemctl show`
-# does not expose this setting.
+# the last uncommented assignment is the effective one. `systemctl show` does
+# not expose these settings.
 journal_max_use() {
+  local key="${1:-SystemMaxUse}"
   systemd-analyze cat-config systemd/journald.conf 2>/dev/null |
-    sed -n 's/^[[:space:]]*SystemMaxUse[[:space:]]*=[[:space:]]*//p' |
+    sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" |
     sed 's/[[:space:]]*$//' |
     tail -1
 }
 
-journal_summary() {
-  local used cap used_kb cap_kb pct
-  # Run through peek: an unprivileged journalctl can open only a subset of
-  # the journal files and still exit 0, so a direct read can silently
-  # undercount against the system-wide cap.
-  used="$(peek journalctl --disk-usage 2>/dev/null |
-    sed -n 's/.*take up \([0-9.]\+[KMGTP]\?\).*/\1/p' | tail -1 || true)"
-  if [[ -z $used ]]; then
-    printf 'unavailable\n'
-    return 0
-  fi
-  cap="$(journal_max_use || true)"
+# Usage of one journal storage directory in human units, or empty when it
+# cannot be read. A specific directory keeps the persistent and volatile
+# totals separate so each can use its own cap.
+journal_usage() {
+  local dir="$1"
+  peek journalctl --directory="$dir" --disk-usage 2>/dev/null |
+    sed -n 's/.*take up \([0-9.]\+[KMGTP]\?\).*/\1/p' | tail -1 || true
+}
+
+journal_cap_usage() {
+  local used="$1" cap="$2" used_kb cap_kb pct
   if [[ -z $cap ]]; then
-    printf '%s (no explicit cap)\n' "$used"
+    printf '%s (no explicit cap)' "$used"
     return 0
   fi
   used_kb="$(size_to_kb "$used" || true)"
-  # journald.conf accepts a bare byte count for SystemMaxUse. journalctl
-  # always prints a unit for usage, so only the cap needs the byte path.
+  # journald.conf accepts a bare byte count. journalctl always prints a unit
+  # for usage, so only the cap needs the byte path.
   if [[ $cap =~ ^[0-9]+$ ]]; then
     cap_kb=$((10#$cap / 1024))
   else
@@ -97,10 +97,41 @@ journal_summary() {
   fi
   if [[ $used_kb =~ ^[0-9]+$ && $cap_kb =~ ^[0-9]+$ ]] && ((cap_kb > 0)); then
     pct=$(((used_kb * 100 + cap_kb / 2) / cap_kb))
-    printf '%s of %s cap (%s%%)\n' "$used" "$cap" "$pct"
+    printf '%s of %s cap (%s%%)' "$used" "$cap" "$pct"
   else
-    printf '%s (cap %s)\n' "$used" "$cap"
+    printf '%s (cap %s)' "$used" "$cap"
   fi
+}
+
+journal_summary() {
+  local persistent runtime p_kb r_kb
+  local -a parts=()
+  persistent="$(journal_usage /var/log/journal)"
+  runtime="$(journal_usage /run/log/journal)"
+  p_kb="$(size_to_kb "$persistent" 2>/dev/null || true)"
+  r_kb="$(size_to_kb "$runtime" 2>/dev/null || true)"
+
+  # A zero or empty storage has no journal files; do not print a 0B line.
+  if [[ $p_kb =~ ^[0-9]+$ ]] && ((p_kb > 0)); then
+    parts+=("persistent $(journal_cap_usage "$persistent" "$(journal_max_use SystemMaxUse || true)")")
+  fi
+  if [[ $r_kb =~ ^[0-9]+$ ]] && ((r_kb > 0)); then
+    parts+=("runtime $(journal_cap_usage "$runtime" "$(journal_max_use RuntimeMaxUse || true)")")
+  fi
+
+  if ((${#parts[@]} == 0)); then
+    if [[ -z $persistent && -z $runtime ]]; then
+      printf 'unavailable\n'
+    else
+      printf 'no journal files\n'
+    fi
+    return 0
+  fi
+  local joined="" part
+  for part in "${parts[@]}"; do
+    joined+="${joined:+; }$part"
+  done
+  printf '%s\n' "$joined"
 }
 
 apt_cache_summary() {
@@ -109,7 +140,12 @@ apt_cache_summary() {
     printf 'none\n'
     return 0
   fi
-  size="$(du -sh "$dir" 2>/dev/null | cut -f1 || true)"
+  # du can print a partial total and still exit non-zero, for example when it
+  # cannot read one entry. Accept the size only when the whole run succeeded.
+  if ! size="$(peek du -sh "$dir" 2>/dev/null | cut -f1)"; then
+    printf 'unavailable\n'
+    return 0
+  fi
   if [[ -z $size ]]; then
     printf 'unavailable\n'
   else

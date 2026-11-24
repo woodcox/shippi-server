@@ -3486,32 +3486,86 @@ test_journal_summary_reports_cap() {
   # journal_summary must elevate: journalctl only sees permission errors when
   # zero files open, so a direct read can quietly report a subset.
   stub peek
-  peek() { printf 'Archived and active journals take up 139.6M in the file system.\n'; }
+  peek() {
+    case "$*" in
+      *--directory=/var/log/journal*) printf 'Archived and active journals take up 139.6M in the file system.\n' ;;
+      *--directory=/run/log/journal*) printf 'Archived and active journals take up 0B in the file system.\n' ;;
+      *) return 1 ;;
+    esac
+  }
   stub journalctl
   journalctl() { return 1; }
   stub journal_max_use
-  journal_max_use() { printf '200M\n'; }
+  journal_max_use() {
+    case "$1" in
+      RuntimeMaxUse) printf '50M\n' ;;
+      *) printf '200M\n' ;;
+    esac
+  }
   out="$(journal_summary)"
-  assert_eq "$out" "139.6M of 200M cap (70%)" || rc=1
+  assert_eq "$out" "persistent 139.6M of 200M cap (70%)" || rc=1
 
   # journald.conf accepts a bare byte count for SystemMaxUse.
-  journal_max_use() { printf '209715200\n'; }
-  peek() { printf 'Archived and active journals take up 100M in the file system.\n'; }
+  journal_max_use() {
+    case "$1" in
+      RuntimeMaxUse) printf '50M\n' ;;
+      *) printf '209715200\n' ;;
+    esac
+  }
+  peek() {
+    case "$*" in
+      *--directory=/var/log/journal*) printf 'Archived and active journals take up 100M in the file system.\n' ;;
+      *--directory=/run/log/journal*) printf 'Archived and active journals take up 0B in the file system.\n' ;;
+    esac
+  }
   out="$(journal_summary)"
-  assert_eq "$out" "100M of 209715200 cap (50%)" || rc=1
+  assert_eq "$out" "persistent 100M of 209715200 cap (50%)" || rc=1
 
   # A leading zero must not turn the byte count into an octal number.
-  journal_max_use() { printf '0209715200\n'; }
+  journal_max_use() {
+    case "$1" in
+      RuntimeMaxUse) printf '50M\n' ;;
+      *) printf '0209715200\n' ;;
+    esac
+  }
   out="$(journal_summary)"
-  assert_eq "$out" "100M of 0209715200 cap (50%)" || rc=1
+  assert_eq "$out" "persistent 100M of 0209715200 cap (50%)" || rc=1
 
   journal_max_use() { return 0; }
   out="$(journal_summary)"
-  assert_eq "$out" "100M (no explicit cap)" || rc=1
+  assert_eq "$out" "persistent 100M (no explicit cap)" || rc=1
 
   peek() { return 1; }
   out="$(journal_summary)"
   assert_eq "$out" "unavailable" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_journal_summary_separates_persistent_and_runtime() {
+  setup_destdir
+  local rc=0 out
+  stub peek
+  peek() {
+    case "$*" in
+      *--directory=/var/log/journal*) printf 'Archived and active journals take up 139.6M in the file system.\n' ;;
+      *--directory=/run/log/journal*) printf 'Archived and active journals take up 8.0M in the file system.\n' ;;
+    esac
+  }
+  stub journal_max_use
+  journal_max_use() {
+    case "$1" in
+      RuntimeMaxUse) printf '50M\n' ;;
+      SystemMaxUse) printf '200M\n' ;;
+    esac
+  }
+  out="$(journal_summary)"
+  assert_eq "$out" "persistent 139.6M of 200M cap (70%); runtime 8.0M of 50M cap (16%)" || rc=1
+
+  # No files in either storage is an empty journal, not an unavailable one.
+  peek() { printf 'Archived and active journals take up 0B in the file system.\n'; }
+  out="$(journal_summary)"
+  assert_eq "$out" "no journal files" || rc=1
   teardown_destdir
   return $rc
 }
@@ -3521,10 +3575,12 @@ test_journal_max_use_accepts_spaced_assignment() {
   local rc=0 out
   # systemd.syntax(7): whitespace around the '=' is ignored.
   systemd-analyze() {
-    printf 'SystemMaxUse=200M\n  SystemMaxUse = 100M  \n'
+    printf 'SystemMaxUse=200M\n  SystemMaxUse = 100M  \nRuntimeMaxUse = 50M\n'
   }
   out="$(journal_max_use)"
   assert_eq "$out" "100M" || rc=1
+  out="$(journal_max_use RuntimeMaxUse)"
+  assert_eq "$out" "50M" || rc=1
   unset -f systemd-analyze
   teardown_destdir
   return $rc
@@ -3533,12 +3589,20 @@ test_journal_max_use_accepts_spaced_assignment() {
 test_apt_cache_summary_reports_reclaimable() {
   setup_destdir
   local rc=0 t out
+  stub peek
+  peek() { "$@"; }
   t="$(mktemp -d)"
   printf 'package' >"$t/pkg.deb"
   out="$(SHIPPI_APT_CACHE_DIR="$t" apt_cache_summary)"
   assert_contains "$out" "reclaimable" || rc=1
-  rm -rf "$t"
 
+  # A partial du total from a failing run must not be reported as measured.
+  stub du
+  du() { printf '4.0K\t%s\n' "$2"; return 1; }
+  out="$(SHIPPI_APT_CACHE_DIR="$t" apt_cache_summary)"
+  assert_eq "$out" "unavailable" || rc=1
+
+  rm -rf "$t"
   out="$(SHIPPI_APT_CACHE_DIR="$t" apt_cache_summary)"
   assert_eq "$out" "none" || rc=1
   teardown_destdir
@@ -5280,6 +5344,7 @@ t 'storage forces KiB for pressure checks'              test_mount_stats_forces_
 t 'storage trims df column padding'                     test_mount_stats_trims_df_padding
 t 'storage rejects a failed numeric df query'           test_mount_stats_rejects_failed_numeric_query
 t 'storage reports journal size against its cap'        test_journal_summary_reports_cap
+t 'journal reports persistent and runtime caps'         test_journal_summary_separates_persistent_and_runtime
 t 'journal cap accepts spaces around equals'            test_journal_max_use_accepts_spaced_assignment
 t 'storage reports reclaimable apt cache'               test_apt_cache_summary_reports_reclaimable
 t 'storage separates docker logical and on-disk'        test_docker_disk_summary_separates_logical_and_on_disk

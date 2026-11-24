@@ -4019,7 +4019,9 @@ mount_stats() {
   local m="$1" row avail_kb
   row="$(LC_ALL=C df -h --output=size,used,avail,pcent,fstype -- "$m" 2>/dev/null | tail -1)" || return 1
   [[ -n $row ]] || return 1
-  avail_kb="$(LC_ALL=C df --output=avail -- "$m" 2>/dev/null | tail -1 || true)"
+  # -k pins the unit: DF_BLOCK_SIZE/BLOCK_SIZE would otherwise change the
+  # number this returns, and disk_mount_warn compares it with KiB.
+  avail_kb="$(LC_ALL=C df -k --output=avail -- "$m" 2>/dev/null | tail -1 || true)"
   printf '%s %s\n' "$row" "${avail_kb:-0}"
 }
 
@@ -4099,12 +4101,17 @@ size_to_kb() {
 # does not expose this setting.
 journal_max_use() {
   systemd-analyze cat-config systemd/journald.conf 2>/dev/null |
-    sed -n 's/^SystemMaxUse=//p' | tail -1
+    sed -n 's/^[[:space:]]*SystemMaxUse[[:space:]]*=[[:space:]]*//p' |
+    sed 's/[[:space:]]*$//' |
+    tail -1
 }
 
 journal_summary() {
   local used cap used_kb cap_kb pct
-  used="$(journalctl --disk-usage 2>/dev/null |
+  # Run through peek: an unprivileged journalctl can open only a subset of
+  # the journal files and still exit 0, so a direct read can silently
+  # undercount against the system-wide cap.
+  used="$(peek journalctl --disk-usage 2>/dev/null |
     sed -n 's/.*take up \([0-9.]\+[KMGTP]\?\).*/\1/p' | tail -1 || true)"
   if [[ -z $used ]]; then
     printf 'unavailable\n'
@@ -4116,7 +4123,13 @@ journal_summary() {
     return 0
   fi
   used_kb="$(size_to_kb "$used" || true)"
-  cap_kb="$(size_to_kb "$cap" || true)"
+  # journald.conf accepts a bare byte count for SystemMaxUse. journalctl
+  # always prints a unit for usage, so only the cap needs the byte path.
+  if [[ $cap =~ ^[0-9]+$ ]]; then
+    cap_kb=$((cap / 1024))
+  else
+    cap_kb="$(size_to_kb "$cap" || true)"
+  fi
   if [[ $used_kb =~ ^[0-9]+$ && $cap_kb =~ ^[0-9]+$ ]] && ((cap_kb > 0)); then
     pct=$(((used_kb * 100 + cap_kb / 2) / cap_kb))
     printf '%s of %s cap (%s%%)\n' "$used" "$cap" "$pct"
@@ -4149,12 +4162,17 @@ docker_disk_summary() {
   fi
 
   local root on_disk images="" summary
-  root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+  # The docker group is root-equivalent, so a hardened box may run as a sudo
+  # user who cannot read the socket. Query directly first and elevate only
+  # when that fails, so a user already in the docker group is not prompted.
+  root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null ||
+    peek docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
   [[ -n $root ]] || root=/var/lib/docker
   on_disk="$(peek du -sh "$root" 2>/dev/null | cut -f1 || true)"
   [[ -n $on_disk ]] || on_disk="on-disk size unavailable (needs root)"
 
-  if summary="$(docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null)"; then
+  if summary="$(docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null ||
+    peek docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null)"; then
     images="$(printf '%s\n' "$summary" | awk -F'\t' '
       $1 == "Images" {
         reclaim = $3
@@ -4269,10 +4287,13 @@ world_writable_summary() {
 # numbers the table printed, so a healthy box says so and a full one names
 # the mount and the consequence.
 mount_pressure_summary() {
-  local m stats size used avail pcent fstype avail_kb boot_warn=0 w
-  local -a free=() warnings=()
+  local m stats size used avail pcent fstype avail_kb boot_warn=0 w free_text=""
+  local -a free=() warnings=() failed=()
   while IFS= read -r m; do
-    stats="$(mount_stats "$m")" || continue
+    if ! stats="$(mount_stats "$m")"; then
+      failed+=("$m")
+      continue
+    fi
     read -r size used avail pcent fstype avail_kb <<<"$stats"
     free+=("${avail} free on ${m}")
     if disk_mount_warn "$m" "$pcent" "$avail_kb"; then
@@ -4282,6 +4303,9 @@ mount_pressure_summary() {
   done < <(storage_mounts)
 
   printf '\n'
+  if ((${#failed[@]})); then
+    printf '  Disk pressure unknown: could not measure %s.\n' "${failed[*]}"
+  fi
   if ((${#warnings[@]})); then
     for w in "${warnings[@]}"; do
       printf '  WARN: %s\n' "$w"
@@ -4290,12 +4314,11 @@ mount_pressure_summary() {
       printf '  A kernel package needs about 25M, so apt will fail the kernel\n'
       printf '  step, keep the old kernel, and silently stop receiving fixes.\n'
     fi
-  else
-    local free_text=""
+  elif ((${#failed[@]} == 0)); then
     for w in "${free[@]}"; do
       free_text+="${free_text:+, }$w"
     done
-    printf '  No disk pressure: %s.\n' "$free_text"
+    printf '  No disk pressure: %s.\n' "${free_text:-no mounts measured}"
   fi
 }
 

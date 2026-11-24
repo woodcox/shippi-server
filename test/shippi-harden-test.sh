@@ -3209,6 +3209,32 @@ test_audit_storage_verdict_names_the_consequence() {
   return $rc
 }
 
+test_audit_storage_verdict_not_healthy_when_mount_unmeasured() {
+  setup_destdir
+  local rc=0 out
+  stub storage_mounts
+  storage_mounts() { printf '/\n/boot/firmware\n'; }
+  stub mount_stats
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      *) return 1 ;;
+    esac
+  }
+
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "Disk pressure unknown: could not measure /boot/firmware" || rc=1
+  if assert_contains "$out" "No disk pressure"; then rc=1; fi
+
+  mount_stats() { return 1; }
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "Disk pressure unknown: could not measure / /boot/firmware" || rc=1
+  if assert_contains "$out" "No disk pressure"; then rc=1; fi
+  if assert_contains "$out" "No disk pressure: ."; then rc=1; fi
+  teardown_destdir
+  return $rc
+}
+
 test_boot_kernel_summary_counts_versions_and_images() {
   setup_destdir
   local rc=0 t out
@@ -3250,23 +3276,65 @@ test_inode_summary_uses_root_filesystem() {
   return $rc
 }
 
+test_mount_stats_forces_kib() {
+  setup_destdir
+  local rc=0 out
+  stub df
+  df() {
+    case "$*" in
+      *-k*--output=avail*) printf 'AVAIL\n442484696\n' ;;
+      *--output=avail*) printf 'AVAIL\n432114\n' ;;
+      *--output=size*) printf '470G 24G 422G 6%% ext4\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  out="$(mount_stats /)"
+  assert_eq "${out##* }" "442484696" || rc=1
+  teardown_destdir
+  return $rc
+}
+
 test_journal_summary_reports_cap() {
   setup_destdir
   local rc=0 out
+  # journal_summary must elevate: journalctl only sees permission errors when
+  # zero files open, so a direct read can quietly report a subset.
+  stub peek
+  peek() { printf 'Archived and active journals take up 139.6M in the file system.\n'; }
   stub journalctl
-  journalctl() { printf 'Archived and active journals take up 139.6M in the file system.\n'; }
+  journalctl() { return 1; }
   stub journal_max_use
   journal_max_use() { printf '200M\n'; }
   out="$(journal_summary)"
   assert_eq "$out" "139.6M of 200M cap (70%)" || rc=1
 
+  # journald.conf accepts a bare byte count for SystemMaxUse.
+  journal_max_use() { printf '209715200\n'; }
+  peek() { printf 'Archived and active journals take up 100M in the file system.\n'; }
+  out="$(journal_summary)"
+  assert_eq "$out" "100M of 209715200 cap (50%)" || rc=1
+
   journal_max_use() { return 0; }
   out="$(journal_summary)"
-  assert_eq "$out" "139.6M (no explicit cap)" || rc=1
+  assert_eq "$out" "100M (no explicit cap)" || rc=1
 
-  journalctl() { return 1; }
+  peek() { return 1; }
   out="$(journal_summary)"
   assert_eq "$out" "unavailable" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_journal_max_use_accepts_spaced_assignment() {
+  setup_destdir
+  local rc=0 out
+  # systemd.syntax(7): whitespace around the '=' is ignored.
+  systemd-analyze() {
+    printf 'SystemMaxUse=200M\n  SystemMaxUse = 100M  \n'
+  }
+  out="$(journal_max_use)"
+  assert_eq "$out" "100M" || rc=1
+  unset -f systemd-analyze
   teardown_destdir
   return $rc
 }
@@ -3303,6 +3371,19 @@ test_docker_disk_summary_separates_logical_and_on_disk() {
 
   out="$(docker_disk_summary)"
   assert_eq "$out" "1.5G on disk, 7.093GB logical images (5.039GB reclaimable)" || rc=1
+
+  # A sudo user outside the docker group: both direct queries fail, so the
+  # elevated fallback must supply the custom data-root and logical summary.
+  docker() { return 1; }
+  peek() {
+    case "$*" in
+      docker\ info*) printf '/srv/docker\n' ;;
+      docker\ system\ df*) printf 'Images\t2GB\t1GB (50%%)\n' ;;
+      du*) printf '900M\t/srv/docker\n' ;;
+    esac
+  }
+  out="$(docker_disk_summary)"
+  assert_eq "$out" "900M on disk, 2GB logical images (1GB reclaimable)" || rc=1
 
   docker_present() { return 1; }
   out="$(docker_disk_summary)"
@@ -5001,10 +5082,13 @@ t 'storage table flags a full boot filesystem'          test_audit_mount_table_m
 t 'storage verdict explains boot pressure'              test_audit_storage_verdict_names_the_consequence
 t 'storage counts kernel versions and images'           test_boot_kernel_summary_counts_versions_and_images
 t 'storage reports inode use for /'                     test_inode_summary_uses_root_filesystem
+t 'storage forces KiB for pressure checks'              test_mount_stats_forces_kib
 t 'storage reports journal size against its cap'        test_journal_summary_reports_cap
+t 'journal cap accepts spaces around equals'            test_journal_max_use_accepts_spaced_assignment
 t 'storage reports reclaimable apt cache'               test_apt_cache_summary_reports_reclaimable
 t 'storage separates docker logical and on-disk'        test_docker_disk_summary_separates_logical_and_on_disk
 t 'storage filters world-writable cache noise'          test_world_writable_summary_excludes_user_caches
+t 'storage verdict is unknown when a mount fails'       test_audit_storage_verdict_not_healthy_when_mount_unmeasured
 t 'audit is offered after the run'                      test_audit_prompt_offered_after_main_output
 t 'declining the audit runs nothing'                    test_audit_prompt_declined_runs_nothing
 t '--audit and --yes skip the audit prompt'             test_audit_flag_and_yes_skip_the_prompt

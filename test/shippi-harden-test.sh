@@ -2641,7 +2641,8 @@ test_help_works() {
 test_list_works() {
   local out
   out="$(bash "$SCRIPT" --list 2>&1)" && assert_contains "$out" "fail2ban" &&
-    assert_contains "$out" "(opt-in)"
+    assert_contains "$out" "(opt-in)" &&
+    assert_contains "$out" "status (opt-in)"
 }
 
 test_bad_task_before_any_change() {
@@ -3295,6 +3296,59 @@ test_audit_storage_verdict_not_healthy_when_mount_unmeasured() {
   return $rc
 }
 
+test_audit_storage_keeps_only_hardening_checks() {
+  setup_destdir
+  local rc=0 out gone
+  stub audit_mount_table
+  audit_mount_table() { printf 'MOUNT-TABLE\n'; }
+  stub boot_kernel_summary
+  boot_kernel_summary() { printf 'KERNELS\n'; }
+  stub world_writable_summary
+  world_writable_summary() { printf 'WORLD-WRITABLE\n'; }
+  stub mount_pressure_summary
+  mount_pressure_summary() { printf 'VERDICT\n'; }
+  stub inode_summary
+  inode_summary() { printf 'INODES\n'; }
+  stub journal_summary
+  journal_summary() { printf 'JOURNAL\n'; }
+  stub apt_cache_summary
+  apt_cache_summary() { printf 'APT-CACHE\n'; }
+  stub docker_disk_summary
+  docker_disk_summary() { printf 'DOCKER\n'; }
+
+  out="$(audit_storage)"
+  assert_contains "$out" "MOUNT-TABLE" || rc=1
+  assert_contains "$out" "KERNELS" || rc=1
+  assert_contains "$out" "WORLD-WRITABLE" || rc=1
+  assert_contains "$out" "VERDICT" || rc=1
+  for gone in INODES JOURNAL APT-CACHE DOCKER; do
+    if assert_contains "$out" "$gone"; then rc=1; fi
+  done
+  teardown_destdir
+  return $rc
+}
+
+test_status_report_shows_capacity_details() {
+  setup_destdir
+  local rc=0 out want
+  stub inode_summary
+  inode_summary() { printf 'INODES\n'; }
+  stub journal_summary
+  journal_summary() { printf 'JOURNAL\n'; }
+  stub apt_cache_summary
+  apt_cache_summary() { printf 'APT-CACHE\n'; }
+  stub docker_disk_summary
+  docker_disk_summary() { printf 'DOCKER\n'; }
+
+  out="$(status_report)"
+  assert_contains "$out" "Storage details" || rc=1
+  for want in INODES JOURNAL APT-CACHE DOCKER; do
+    assert_contains "$out" "$want" || rc=1
+  done
+  teardown_destdir
+  return $rc
+}
+
 test_boot_kernel_summary_counts_versions_and_images() {
   setup_destdir
   local rc=0 t out
@@ -3616,6 +3670,31 @@ test_audit_flag_and_yes_skip_the_prompt() {
   teardown_destdir
   SELECTED=()
   RUN_AUDIT=0
+  return $rc
+}
+
+test_status_task_skips_manual_followups() {
+  # status is a read-only report. The hardening follow-ups assume a hardening
+  # run and would bury the capacity figures the user asked for.
+  setup_destdir
+  local rc=0 out
+  stub banner
+  banner() { :; }
+  stub have
+  have() { return 1; }
+  stub status_report
+  status_report() { printf 'STATUS-RAN\n'; }
+  stub manual_followups
+  manual_followups() { printf 'FOLLOWUPS-PRINTED\n'; }
+  SELECTED=(status)
+  DRY_RUN=0
+  ASSUME_YES=0
+
+  out="$(main 2>&1)"
+  assert_contains "$out" "STATUS-RAN" || rc=1
+  if assert_contains "$out" "FOLLOWUPS-PRINTED"; then rc=1; fi
+  SELECTED=()
+  teardown_destdir
   return $rc
 }
 
@@ -5204,9 +5283,12 @@ t 'storage reports reclaimable apt cache'               test_apt_cache_summary_r
 t 'storage separates docker logical and on-disk'        test_docker_disk_summary_separates_logical_and_on_disk
 t 'storage filters world-writable cache noise'          test_world_writable_summary_excludes_user_caches
 t 'storage verdict is unknown when a mount fails'       test_audit_storage_verdict_not_healthy_when_mount_unmeasured
+t 'audit keeps only hardening checks'                   test_audit_storage_keeps_only_hardening_checks
+t 'status reports capacity details'                     test_status_report_shows_capacity_details
 t 'audit is offered after the run'                      test_audit_prompt_offered_after_main_output
 t 'declining the audit runs nothing'                    test_audit_prompt_declined_runs_nothing
 t '--audit and --yes skip the audit prompt'             test_audit_flag_and_yes_skip_the_prompt
+t 'status-only run skips follow-ups'                    test_status_task_skips_manual_followups
 
 t 'the firewall loop visits every port'                 test_firewall_loop_visits_every_port
 t 'the firewall loop skips the ssh port'                test_firewall_skips_the_ssh_port

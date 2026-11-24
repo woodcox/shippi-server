@@ -162,11 +162,18 @@ after an update.
 
 The `filesystem & storage` section shows free space for `/`, `/boot` and
 `/boot/firmware` (whichever are separate mounts), the kernel versions and
-images accumulating in `/boot`, inode use, journal size against its configured
-cap, reclaimable apt cache and Docker space, and world-writable files outside
-user caches. A boot filesystem under 100M free is called out explicitly,
-because apt then fails the kernel step, keeps the old kernel, and silently
-stops receiving kernel security fixes.
+images accumulating in `/boot`, and world-writable files outside homes,
+caches, temp dirs, and container layers. A boot filesystem under 100M free is
+called out explicitly, because apt then fails the kernel step, keeps the old
+kernel, and silently stops receiving kernel security fixes.
+
+Capacity details — inode use, journal size against its configured cap,
+reclaimable apt cache, and Docker space — live in the opt-in status task, so
+the audit stays focused on hardening:
+
+```bash
+shippi-harden status
+```
 
 Run `shippi-harden` normally. It asks for sudo once and caches the credential
 for the privileged steps, so prefixing it with `sudo` is optional. It needs root
@@ -177,6 +184,7 @@ rules are reported as unverified rather than checked.
 
 shippi-harden                                     # apply the defaults; asks for sudo once
 shippi-harden --list                              # available tasks
+shippi-harden status                              # capacity details (opt-in)
 shippi-harden --dry-run                           # print the plan, change nothing
 shippi-harden ssh firewall                        # just these two
 shippi-harden --yes                               # recommended defaults, no hardening prompts

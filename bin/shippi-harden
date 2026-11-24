@@ -75,7 +75,7 @@ MANAGED_END="# END shippi hardening"
 # aideinit builds a file database over the whole filesystem. On an SD card
 # that is minutes of 100% CPU, so it is opt-in rather than part of the
 # default run.
-TASKS=(packages users accounts services ssh firewall fail2ban updates apparmor sysctl aide audit)
+TASKS=(packages users accounts services ssh firewall fail2ban updates apparmor sysctl aide audit status)
 DEFAULT_TASKS=(packages users accounts services ssh firewall fail2ban updates apparmor sysctl audit)
 
 # ---------------------------------------------------------------------------
@@ -177,6 +177,7 @@ Tasks (default: all but aide):
   sysctl      network + kernel sysctls, journal size cap
   aide        opt-in file integrity monitoring (slow, first run is minutes)
   audit       report state, failed units and pending reboot, change nothing
+  status      capacity details: inodes, journal, apt cache, Docker (opt-in)
 
 Options:
   -y, --yes         accept recommended defaults, do not prompt
@@ -4347,16 +4348,26 @@ mount_pressure_summary() {
   fi
 }
 
+# Hardening-relevant storage checks only. Capacity details live in the opt-in
+# status task, so the audit stays about what can silently stop security
+# updates or expose the box.
 audit_storage() {
   audit_mount_table
   printf '\n'
   printf '  %-14s %s\n' kernels "$(boot_kernel_summary)"
+  printf '  %-14s %s\n' "world-writable" "$(world_writable_summary)"
+  mount_pressure_summary
+}
+
+# Capacity details are useful, but they are not hardening checks: a large
+# journal or a reclaimable apt cache does not stop security updates. Keep them
+# in an opt-in task so the audit does not turn into a general health dashboard.
+status_report() {
+  section "Storage details"
   printf '  %-14s %s\n' inodes "$(inode_summary)"
   printf '  %-14s %s\n' journal "$(journal_summary)"
   printf '  %-14s %s\n' "apt cache" "$(apt_cache_summary)"
   printf '  %-14s %s\n' docker "$(docker_disk_summary)"
-  printf '  %-14s %s\n' "world-writable" "$(world_writable_summary)"
-  mount_pressure_summary
 }
 
 audit_system_health() {
@@ -4620,6 +4631,12 @@ known_task() {
   return 1
 }
 
+# A status-only run is a read-only report. The hardening follow-ups assume a
+# hardening run and would bury the figures the user asked for.
+status_only() {
+  ((${#SELECTED[@]} == 1)) && [[ ${SELECTED[0]} == status ]]
+}
+
 main() {
   while (($# > 0)); do
     case "$1" in
@@ -4698,7 +4715,10 @@ main() {
   want_task aide && configure_aide
 
   want_task audit && ((RUN_AUDIT)) && audit
-  manual_followups
+  want_task status && status_report
+  if ! status_only; then
+    manual_followups
+  fi
 
   if ((DRY_RUN)); then
     printf '\n%s   dry run. Re-run without --dry-run when this looks right.%s\n' "$C_DIM" "$C_OFF"

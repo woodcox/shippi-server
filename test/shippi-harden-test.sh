@@ -11,6 +11,7 @@ set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$TEST_DIR/bin/shippi-harden"
+STATUS_SCRIPT="$TEST_DIR/bin/shippi-status"
 PASS=0
 FAIL=0
 # Test functions already run, so t() can reject a duplicate registration
@@ -28,6 +29,10 @@ export TMPDIR="$TEST_TMP"
 
 # shellcheck source=../bin/shippi-harden
 source "$SCRIPT"
+# shippi-status reuses the audit's primitives but owns the capacity helpers.
+# Sourcing it here also exercises the no-reexecution guard.
+# shellcheck source=../bin/shippi-status
+source "$STATUS_SCRIPT"
 
 # The sourced script installs an EXIT trap for its audit temp file. Replace it
 # with one that cleans both that file and this suite's private temp root.
@@ -2640,9 +2645,31 @@ test_help_works() {
 
 test_list_works() {
   local out
-  out="$(bash "$SCRIPT" --list 2>&1)" && assert_contains "$out" "fail2ban" &&
-    assert_contains "$out" "(opt-in)" &&
-    assert_contains "$out" "status (opt-in)"
+  out="$(bash "$SCRIPT" --list 2>&1)" || return 1
+  assert_contains "$out" "fail2ban" || return 1
+  assert_contains "$out" "(opt-in)" || return 1
+  if assert_contains "$out" "status (opt-in)"; then
+    printf '        status should be a separate command, not a task\n'
+    return 1
+  fi
+}
+
+test_status_script_help() {
+  local rc=0 out
+  [[ -x $STATUS_SCRIPT ]] || rc=1
+  out="$(bash "$STATUS_SCRIPT" --help 2>&1)" || rc=1
+  assert_contains "$out" "Usage: shippi-status" || rc=1
+  assert_contains "$out" "Read-only" || rc=1
+  return $rc
+}
+
+test_status_script_rejects_unknown_option() {
+  local rc=0 out status=0
+  out="$(bash "$STATUS_SCRIPT" --bogus 2>&1)"
+  status=$?
+  [[ $status -eq 2 ]] || rc=1
+  assert_contains "$out" "unknown option" || rc=1
+  return $rc
 }
 
 test_bad_task_before_any_change() {
@@ -3670,31 +3697,6 @@ test_audit_flag_and_yes_skip_the_prompt() {
   teardown_destdir
   SELECTED=()
   RUN_AUDIT=0
-  return $rc
-}
-
-test_status_task_skips_manual_followups() {
-  # status is a read-only report. The hardening follow-ups assume a hardening
-  # run and would bury the capacity figures the user asked for.
-  setup_destdir
-  local rc=0 out
-  stub banner
-  banner() { :; }
-  stub have
-  have() { return 1; }
-  stub status_report
-  status_report() { printf 'STATUS-RAN\n'; }
-  stub manual_followups
-  manual_followups() { printf 'FOLLOWUPS-PRINTED\n'; }
-  SELECTED=(status)
-  DRY_RUN=0
-  ASSUME_YES=0
-
-  out="$(main 2>&1)"
-  assert_contains "$out" "STATUS-RAN" || rc=1
-  if assert_contains "$out" "FOLLOWUPS-PRINTED"; then rc=1; fi
-  SELECTED=()
-  teardown_destdir
   return $rc
 }
 
@@ -5288,7 +5290,8 @@ t 'status reports capacity details'                     test_status_report_shows
 t 'audit is offered after the run'                      test_audit_prompt_offered_after_main_output
 t 'declining the audit runs nothing'                    test_audit_prompt_declined_runs_nothing
 t '--audit and --yes skip the audit prompt'             test_audit_flag_and_yes_skip_the_prompt
-t 'status-only run skips follow-ups'                    test_status_task_skips_manual_followups
+t 'status command shows help'                           test_status_script_help
+t 'status command rejects unknown options'               test_status_script_rejects_unknown_option
 
 t 'the firewall loop visits every port'                 test_firewall_loop_visits_every_port
 t 'the firewall loop skips the ssh port'                test_firewall_skips_the_ssh_port

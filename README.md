@@ -65,6 +65,7 @@ Shippi-server provides:
  - `shippi-refresh`: Reinstall Shippi with initial configs
  - `shippi-ssh`: Add SSH key for remote access
  - `shippi-harden`: One-time security hardening — run `shippi-harden`; it asks for sudo once. Use `--dry-run` first to see the plan. See the security hardening section for further details
+ - `shippi-status`: Read-only storage capacity details — inode use, journal cap, apt cache, Docker space
 
  - [opencode](https://opencode.ai/): alias `oc`
  - Claude: alias `cc=printf "\033[2J\033[3J\033[H" && claude --permission-mode bypassPermissions`
@@ -168,11 +169,11 @@ called out explicitly, because apt then fails the kernel step, keeps the old
 kernel, and silently stops receiving kernel security fixes.
 
 Capacity details — inode use, journal size against its configured cap,
-reclaimable apt cache, and Docker space — live in the opt-in status task, so
-the audit stays focused on hardening:
+reclaimable apt cache, and Docker space — live in the `shippi-status`
+command, so the audit stays focused on hardening:
 
 ```bash
-shippi-harden status
+shippi-status
 ```
 
 Run `shippi-harden` normally. It asks for sudo once and caches the credential
@@ -184,7 +185,7 @@ rules are reported as unverified rather than checked.
 
 shippi-harden                                     # apply the defaults; asks for sudo once
 shippi-harden --list                              # available tasks
-shippi-harden status                              # capacity details (opt-in)
+shippi-status                                     # capacity details
 shippi-harden --dry-run                           # print the plan, change nothing
 shippi-harden ssh firewall                        # just these two
 shippi-harden --yes                               # recommended defaults, no hardening prompts

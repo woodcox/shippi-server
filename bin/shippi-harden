@@ -75,7 +75,7 @@ MANAGED_END="# END shippi hardening"
 # aideinit builds a file database over the whole filesystem. On an SD card
 # that is minutes of 100% CPU, so it is opt-in rather than part of the
 # default run.
-TASKS=(packages users accounts services ssh firewall fail2ban updates apparmor sysctl aide audit status)
+TASKS=(packages users accounts services ssh firewall fail2ban updates apparmor sysctl aide audit)
 DEFAULT_TASKS=(packages users accounts services ssh firewall fail2ban updates apparmor sysctl audit)
 
 # ---------------------------------------------------------------------------
@@ -177,7 +177,6 @@ Tasks (default: all but aide):
   sysctl      network + kernel sysctls, journal size cap
   aide        opt-in file integrity monitoring (slow, first run is minutes)
   audit       report state, failed units and pending reboot, change nothing
-  status      capacity details: inodes, journal, apt cache, Docker (opt-in)
 
 Options:
   -y, --yes         accept recommended defaults, do not prompt
@@ -4081,141 +4080,6 @@ audit_mount_table() {
   done < <(storage_mounts)
 }
 
-# Counts for humans: 715529 -> 716k, 30313024 -> 30.3M.
-human_count() {
-  awk -v n="$1" 'BEGIN {
-    if (n >= 1000000000) printf "%.1fB", n / 1000000000
-    else if (n >= 1000000) printf "%.1fM", n / 1000000
-    else if (n >= 1000) printf "%.0fk", n / 1000
-    else printf "%d", n
-  }'
-}
-
-inode_summary() {
-  local row total used pcent
-  row="$(LC_ALL=C df --output=itotal,iused,ipcent -- / 2>/dev/null | tail -1 || true)"
-  read -r total used pcent <<<"$row"
-  if [[ ! $total =~ ^[0-9]+$ || ! $used =~ ^[0-9]+$ || ! $pcent =~ ^[0-9]+%$ ]]; then
-    printf 'unavailable\n'
-    return 0
-  fi
-  printf '/  %s used (%s of %s)\n' \
-    "$pcent" "$(human_count "$used")" "$(human_count "$total")"
-}
-
-# Journald sizes are printed as 139.6M, 1.2G, ... Convert to KiB so the
-# percentage against the cap is computed in one unit.
-size_to_kb() {
-  awk -v s="$1" 'BEGIN {
-    if (s !~ /^[0-9.]+[KMGTP]?$/) exit 1
-    unit = substr(s, length(s), 1)
-    n = s
-    if (unit ~ /[KMGTP]/) sub(/[KMGTP]$/, "", n)
-    mult = 1
-    if (unit == "M") mult = 1024
-    else if (unit == "G") mult = 1048576
-    else if (unit == "T") mult = 1073741824
-    else if (unit == "P") mult = 1099511627776
-    printf "%d", n * mult
-  }'
-}
-
-# cat-config merges the main file and every drop-in in precedence order, so
-# the last uncommented SystemMaxUse= is the effective one. `systemctl show`
-# does not expose this setting.
-journal_max_use() {
-  systemd-analyze cat-config systemd/journald.conf 2>/dev/null |
-    sed -n 's/^[[:space:]]*SystemMaxUse[[:space:]]*=[[:space:]]*//p' |
-    sed 's/[[:space:]]*$//' |
-    tail -1
-}
-
-journal_summary() {
-  local used cap used_kb cap_kb pct
-  # Run through peek: an unprivileged journalctl can open only a subset of
-  # the journal files and still exit 0, so a direct read can silently
-  # undercount against the system-wide cap.
-  used="$(peek journalctl --disk-usage 2>/dev/null |
-    sed -n 's/.*take up \([0-9.]\+[KMGTP]\?\).*/\1/p' | tail -1 || true)"
-  if [[ -z $used ]]; then
-    printf 'unavailable\n'
-    return 0
-  fi
-  cap="$(journal_max_use || true)"
-  if [[ -z $cap ]]; then
-    printf '%s (no explicit cap)\n' "$used"
-    return 0
-  fi
-  used_kb="$(size_to_kb "$used" || true)"
-  # journald.conf accepts a bare byte count for SystemMaxUse. journalctl
-  # always prints a unit for usage, so only the cap needs the byte path.
-  if [[ $cap =~ ^[0-9]+$ ]]; then
-    cap_kb=$((10#$cap / 1024))
-  else
-    cap_kb="$(size_to_kb "$cap" || true)"
-  fi
-  if [[ $used_kb =~ ^[0-9]+$ && $cap_kb =~ ^[0-9]+$ ]] && ((cap_kb > 0)); then
-    pct=$(((used_kb * 100 + cap_kb / 2) / cap_kb))
-    printf '%s of %s cap (%s%%)\n' "$used" "$cap" "$pct"
-  else
-    printf '%s (cap %s)\n' "$used" "$cap"
-  fi
-}
-
-apt_cache_summary() {
-  local dir="${SHIPPI_APT_CACHE_DIR:-/var/cache/apt/archives}" size
-  if [[ ! -d $dir ]]; then
-    printf 'none\n'
-    return 0
-  fi
-  size="$(du -sh "$dir" 2>/dev/null | cut -f1 || true)"
-  if [[ -z $size ]]; then
-    printf 'unavailable\n'
-  else
-    printf '%s reclaimable\n' "$size"
-  fi
-}
-
-# `docker system df` sizes are logical and count shared layers per image, so
-# they can be several times the blocks the directory occupies. Both numbers
-# are useful, for different questions, hence both on the line.
-docker_disk_summary() {
-  if ! docker_present; then
-    printf 'not running\n'
-    return 0
-  fi
-
-  local root on_disk images="" summary
-  # The docker group is root-equivalent, so a hardened box may run as a sudo
-  # user who cannot read the socket. Query directly first and elevate only
-  # when that fails, so a user already in the docker group is not prompted.
-  root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null ||
-    peek docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
-  [[ -n $root ]] || root=/var/lib/docker
-  on_disk="$(peek du -sh "$root" 2>/dev/null | cut -f1 || true)"
-  [[ -n $on_disk ]] || on_disk="on-disk size unavailable (needs root)"
-
-  if summary="$(docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null ||
-    peek docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null)"; then
-    images="$(printf '%s\n' "$summary" | awk -F'\t' '
-      $1 == "Images" {
-        reclaim = $3
-        sub(/ *\([^)]*\)[[:space:]]*$/, "", reclaim)
-        printf "%s logical images (%s reclaimable)", $2, reclaim
-        found = 1
-        exit
-      }
-      END { if (!found) exit 1 }
-    ')" || images=""
-  fi
-
-  if [[ -n $images ]]; then
-    printf '%s on disk, %s\n' "$on_disk" "$images"
-  else
-    printf '%s on disk, logical usage unavailable\n' "$on_disk"
-  fi
-}
-
 # Kernel versions and images apt has left in /boot. The mount table cannot
 # show this on a Pi 5, where /boot is on / and only /boot/firmware is a
 # separate filesystem, so space pressure from old kernels would otherwise be
@@ -4357,17 +4221,6 @@ audit_storage() {
   printf '  %-14s %s\n' kernels "$(boot_kernel_summary)"
   printf '  %-14s %s\n' "world-writable" "$(world_writable_summary)"
   mount_pressure_summary
-}
-
-# Capacity details are useful, but they are not hardening checks: a large
-# journal or a reclaimable apt cache does not stop security updates. Keep them
-# in an opt-in task so the audit does not turn into a general health dashboard.
-status_report() {
-  section "Storage details"
-  printf '  %-14s %s\n' inodes "$(inode_summary)"
-  printf '  %-14s %s\n' journal "$(journal_summary)"
-  printf '  %-14s %s\n' "apt cache" "$(apt_cache_summary)"
-  printf '  %-14s %s\n' docker "$(docker_disk_summary)"
 }
 
 audit_system_health() {
@@ -4631,12 +4484,6 @@ known_task() {
   return 1
 }
 
-# A status-only run is a read-only report. The hardening follow-ups assume a
-# hardening run and would bury the figures the user asked for.
-status_only() {
-  ((${#SELECTED[@]} == 1)) && [[ ${SELECTED[0]} == status ]]
-}
-
 main() {
   while (($# > 0)); do
     case "$1" in
@@ -4715,10 +4562,7 @@ main() {
   want_task aide && configure_aide
 
   want_task audit && ((RUN_AUDIT)) && audit
-  want_task status && status_report
-  if ! status_only; then
-    manual_followups
-  fi
+  manual_followups
 
   if ((DRY_RUN)); then
     printf '\n%s   dry run. Re-run without --dry-run when this looks right.%s\n' "$C_DIM" "$C_OFF"

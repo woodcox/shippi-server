@@ -3995,19 +3995,30 @@ BOOT_MIN_FREE_KB=102400
 # True when $1 is a mountpoint in its own right. /boot is a directory on / on
 # a Pi 5 (Bookworm moved the firmware to /boot/firmware), but it is the vfat
 # boot partition itself on older layouts. Both need looking at; a path
-# existing is not enough to tell which one this is.
+# existing is not enough to tell which one this is. Returns 2 when df cannot
+# answer, so callers can report unknown instead of silently dropping a mount.
 is_mountpoint() {
+  local target
   [[ -d $1 ]] || return 1
-  [[ $(LC_ALL=C df --output=target -- "$1" 2>/dev/null | tail -1) == "$1" ]]
+  target="$(LC_ALL=C df --output=target -- "$1" 2>/dev/null | tail -1)"
+  [[ -n $target ]] || return 2
+  [[ $target == "$1" ]]
 }
 
 # Mounts whose free space can break the box. /boot/firmware only exists on
-# layouts that have it; /boot is included only when it is separate.
+# layouts that have it; /boot is included only when it is separate. A mount
+# whose status cannot be determined is included so mount_stats can report it
+# unavailable, rather than disappearing from the table and the verdict.
 storage_mounts() {
-  local m
+  local m rc
   printf '/\n'
   for m in /boot /boot/firmware; do
     if is_mountpoint "$m"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if ((rc == 0 || rc == 2)); then
       printf '%s\n' "$m"
     fi
   done
@@ -4028,6 +4039,13 @@ mount_stats() {
   printf '%s %s\n' "$row" "$avail_kb"
 }
 
+# True when a boot mount is below the absolute floor. The 90% rule alone is
+# not enough to claim the next kernel package will not fit.
+disk_mount_low_free() {
+  local m="$1" avail_kb="$2"
+  [[ $m != / && $avail_kb =~ ^[0-9]+$ ]] && ((avail_kb < BOOT_MIN_FREE_KB))
+}
+
 # True when a mount deserves a WARN. Every mount gets the 90% rule; the boot
 # mounts also get the absolute floor, because 90% of a 510M partition is
 # still 51M free, which is not enough for a kernel package.
@@ -4036,10 +4054,7 @@ disk_mount_warn() {
   if [[ $pcent =~ ^[0-9]+$ ]] && ((pcent >= 90)); then
     return 0
   fi
-  if [[ $m != / && $avail_kb =~ ^[0-9]+$ ]] && ((avail_kb < BOOT_MIN_FREE_KB)); then
-    return 0
-  fi
-  return 1
+  disk_mount_low_free "$m" "$avail_kb"
 }
 
 audit_mount_table() {
@@ -4290,7 +4305,7 @@ world_writable_summary() {
 # numbers the table printed, so a healthy box says so and a full one names
 # the mount and the consequence.
 mount_pressure_summary() {
-  local m stats size used avail pcent fstype avail_kb boot_warn=0 w free_text=""
+  local m stats size used avail pcent fstype avail_kb boot_low_free=0 w free_text=""
   local -a free=() warnings=() failed=()
   while IFS= read -r m; do
     if ! stats="$(mount_stats "$m")"; then
@@ -4301,7 +4316,9 @@ mount_pressure_summary() {
     free+=("${avail} free on ${m}")
     if disk_mount_warn "$m" "$pcent" "$avail_kb"; then
       warnings+=("${m} has ${avail} free (${pcent} used)")
-      [[ $m == / ]] || boot_warn=1
+      if disk_mount_low_free "$m" "$avail_kb"; then
+        boot_low_free=1
+      fi
     fi
   done < <(storage_mounts)
 
@@ -4313,7 +4330,7 @@ mount_pressure_summary() {
     for w in "${warnings[@]}"; do
       printf '  WARN: %s\n' "$w"
     done
-    if ((boot_warn)); then
+    if ((boot_low_free)); then
       printf '  A kernel package needs about 25M, so apt will fail the kernel\n'
       printf '  step, keep the old kernel, and silently stop receiving fixes.\n'
     fi

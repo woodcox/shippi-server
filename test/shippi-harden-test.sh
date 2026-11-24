@@ -3145,6 +3145,34 @@ test_audit_hints_show_where_to_edit() {
   return $rc
 }
 
+test_storage_mounts_keeps_unmeasurable_mounts() {
+  setup_destdir
+  local rc=0 out
+  stub is_mountpoint
+  is_mountpoint() { return 2; }
+  out="$(storage_mounts)"
+  assert_eq "$out" $'/\n/boot\n/boot/firmware' || rc=1
+
+  is_mountpoint() { return 1; }
+  out="$(storage_mounts)"
+  assert_eq "$out" "/" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_is_mountpoint_reports_unknown_on_df_failure() {
+  setup_destdir
+  local rc=0 d status=0
+  d="$(mktemp -d)"
+  stub df
+  df() { return 1; }
+  is_mountpoint "$d" || status=$?
+  assert_eq "$status" "2" || rc=1
+  rm -rf "$d"
+  teardown_destdir
+  return $rc
+}
+
 test_audit_mount_table_marks_boot_pressure() {
   setup_destdir
   local rc=0 out
@@ -3205,6 +3233,38 @@ test_audit_storage_verdict_names_the_consequence() {
   out="$(mount_pressure_summary)"
   assert_contains "$out" "WARN: /boot/firmware has 21M free (97% used)" || rc=1
   assert_contains "$out" "kernel package needs about 25M" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_audit_storage_verdict_distinguishes_floor_from_percentage() {
+  setup_destdir
+  local rc=0 out
+  stub storage_mounts
+  storage_mounts() { printf '/\n/boot/firmware\n'; }
+  stub mount_stats
+
+  # 82% used but only 91M free: the absolute floor is breached.
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '510M 419M 91M 82%% vfat 93184\n' ;;
+    esac
+  }
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "WARN: /boot/firmware has 91M free (82% used)" || rc=1
+  assert_contains "$out" "kernel package needs about 25M" || rc=1
+
+  # 91% used but 900M free: percentage rule only, so no apt-failure claim.
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '20G 18.2G 900M 91%% ext4 921600\n' ;;
+    esac
+  }
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "WARN: /boot/firmware has 900M free (91% used)" || rc=1
+  if assert_contains "$out" "kernel package needs about 25M"; then rc=1; fi
   teardown_destdir
   return $rc
 }
@@ -5112,7 +5172,10 @@ t 'failed units returns unit names only'                test_failed_systemd_unit
 t 'audit timeout is inside peek'                        test_audit_timeout_is_inside_peek
 t 'audit hints point at config files'                   test_audit_hints_show_where_to_edit
 t 'storage table flags a full boot filesystem'          test_audit_mount_table_marks_boot_pressure
+t 'storage keeps mounts it cannot measure'              test_storage_mounts_keeps_unmeasurable_mounts
+t 'is_mountpoint reports unknown on df failure'         test_is_mountpoint_reports_unknown_on_df_failure
 t 'storage verdict explains boot pressure'              test_audit_storage_verdict_names_the_consequence
+t 'storage verdict separates floor from percentage'     test_audit_storage_verdict_distinguishes_floor_from_percentage
 t 'storage counts kernel versions and images'           test_boot_kernel_summary_counts_versions_and_images
 t 'storage reports inode use for /'                     test_inode_summary_uses_root_filesystem
 t 'storage forces KiB for pressure checks'              test_mount_stats_forces_kib

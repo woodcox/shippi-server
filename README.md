@@ -160,6 +160,13 @@ runs it directly. It reports failed systemd units, whether a reboot is pending
 newest one installed — the three checks that matter most on a headless box
 after an update.
 
+The `filesystem & storage` section shows free space for `/`, `/boot` and
+`/boot/firmware` (whichever are separate mounts), the kernel versions and
+images accumulating in `/boot`, and world-writable files outside homes,
+caches, temp dirs, and container layers. A boot filesystem under 100M free or
+at 90% used is called out explicitly, because apt may then fail the kernel
+step, keep the old kernel, and silently stop receiving kernel security fixes.
+
 Run `shippi-harden` normally. It asks for sudo once and caches the credential
 for the privileged steps, so prefixing it with `sudo` is optional. It needs root
 to read `/etc/ufw/after.rules` (`0640 root:root`); without it the `DOCKER-USER`

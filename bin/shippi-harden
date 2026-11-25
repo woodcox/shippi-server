@@ -3982,6 +3982,293 @@ newest_installed_kernel() {
   printf '%s\n' "${candidates[@]}" | sort -V | tail -1
 }
 
+# ---------------------------------------------------------------------------
+# filesystem & storage
+# ---------------------------------------------------------------------------
+# A full /boot partition is the classic Pi way to stop receiving kernel
+# security patches: apt cannot unpack the new image, the box keeps booting the
+# old kernel, and nothing else reports it. The threshold is about the next
+# update fitting, not a round percentage, so the table and the verdict use the
+# same number.
+BOOT_MIN_FREE_KB=102400
+# Rough size of one kernel package. Distinct from the floor above: the 100M
+# floor is conservative headroom for a few packages plus initrd/firmware, while
+# this is the number the warning quotes to explain why space matters.
+KERNEL_PKG_NEEDS_MB=25
+# is_mountpoint() return status when df cannot answer, as distinct from 0 ("is
+# a mount") and 1 ("is not a mount"). Callers report it as unknown rather than
+# silently dropping the mount.
+MOUNT_STATUS_UNKNOWN=2
+
+# True when $1 is a mountpoint in its own right. /boot is a directory on / on
+# a Pi 5 (Bookworm moved the firmware to /boot/firmware), but it is the vfat
+# boot partition itself on older layouts. Both need looking at; a path
+# existing is not enough to tell which one this is. Returns MOUNT_STATUS_UNKNOWN
+# when df cannot answer, so callers can report unknown instead of silently
+# dropping a mount.
+is_mountpoint() {
+  local target
+  [[ -d $1 ]] || return 1
+  target="$(LC_ALL=C df --output=target -- "$1" 2>/dev/null | tail -1)"
+  [[ -n $target ]] || return "$MOUNT_STATUS_UNKNOWN"
+  [[ $target == "$1" ]]
+}
+
+# Mounts whose free space can break the box. /boot/firmware only exists on
+# layouts that have it; /boot is included only when it is separate. A mount
+# whose status cannot be determined is included so mount_stats can report it
+# unavailable, rather than disappearing from the table and the verdict.
+storage_mounts() {
+  local m rc
+  printf '/\n'
+  for m in /boot /boot/firmware; do
+    if is_mountpoint "$m"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if ((rc == 0 || rc == MOUNT_STATUS_UNKNOWN)); then
+      printf '%s\n' "$m"
+    fi
+  done
+}
+
+# "size used avail pcent fstype avail_kb" for one mount, or non-zero when df
+# cannot answer. One line, so callers can consume it with `read`.
+mount_stats() {
+  local m="$1" row avail_kb
+  row="$(LC_ALL=C df -h --output=size,used,avail,pcent,fstype -- "$m" 2>/dev/null | tail -1)" || return 1
+  [[ -n $row ]] || return 1
+  # -k pins the unit: DF_BLOCK_SIZE/BLOCK_SIZE would otherwise change the
+  # number this returns, and disk_mount_warn compares it with KiB. A failed
+  # or non-numeric query must not look like zero free space, or the report
+  # invents disk pressure that was never measured. df right-aligns the
+  # column, so trim its padding before validating.
+  avail_kb="$(LC_ALL=C df -k --output=avail -- "$m" 2>/dev/null | tail -1)" || return 1
+  if [[ $avail_kb =~ ^[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+    avail_kb="${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+  printf '%s %s\n' "$row" "$avail_kb"
+}
+
+# True when a boot mount is below the absolute floor. The 90% rule alone is
+# not enough to claim the next kernel package will not fit.
+disk_mount_low_free() {
+  local m="$1" avail_kb="$2"
+  [[ $m != / && $avail_kb =~ ^[0-9]+$ ]] && ((avail_kb < BOOT_MIN_FREE_KB))
+}
+
+# True when a boot mount deserves a WARN. Only /boot and /boot/firmware are
+# warned: they get the 90% rule plus the absolute floor, because 90% of a
+# 510M partition is still 51M free, which is not enough for a kernel package.
+# The root filesystem is reported in the table but never warned.
+disk_mount_warn() {
+  local m="$1" pcent="${2%\%}" avail_kb="$3"
+  [[ $m != / ]] || return 1
+  if [[ $pcent =~ ^[0-9]+$ ]] && ((pcent >= 90)); then
+    return 0
+  fi
+  disk_mount_low_free "$m" "$avail_kb"
+}
+
+# One df pass per mount, shared by the table and the verdict. Populates the
+# globals MOUNT_PATH and MOUNT_STATS in storage_mounts order, where an empty
+# stats string marks a mount whose measurement failed. The table and the
+# verdict both consume the same numbers instead of each re-querying df.
+collect_storage_mounts() {
+  local m stats
+  MOUNT_PATH=()
+  MOUNT_STATS=()
+  while IFS= read -r m; do
+    MOUNT_PATH+=("$m")
+    if stats="$(mount_stats "$m")"; then
+      MOUNT_STATS+=("$stats")
+    else
+      MOUNT_STATS+=("")
+    fi
+  done < <(storage_mounts)
+}
+
+audit_mount_table() {
+  local i m stats size used avail pcent fstype avail_kb mark
+  printf '  %-16s %-5s %5s %5s %6s %5s\n' Mount Type Size Used Avail Use%
+  for i in "${!MOUNT_PATH[@]}"; do
+    m="${MOUNT_PATH[$i]}"
+    stats="${MOUNT_STATS[$i]}"
+    if [[ -z $stats ]]; then
+      printf '  %-16s unavailable\n' "$m"
+      continue
+    fi
+    read -r size used avail pcent fstype avail_kb <<<"$stats"
+    mark=""
+    if disk_mount_warn "$m" "$pcent" "$avail_kb"; then
+      mark="  WARN"
+    fi
+    printf '  %-16s %-5s %5s %5s %6s %5s%s\n' \
+      "$m" "$fstype" "$size" "$used" "$avail" "$pcent" "$mark"
+  done
+}
+
+# Kernel versions and images apt has left in /boot. The mount table cannot
+# show this on a Pi 5, where /boot is on / and only /boot/firmware is a
+# separate filesystem, so space pressure from old kernels would otherwise be
+# invisible. `images` counts vmlinuz files; the size includes initrds too.
+boot_kernel_summary() {
+  local boot="${SHIPPI_BOOT_DIR:-/boot}"
+  local -a images=()
+  local -a kernels=()
+  local -A versions=()
+  local f files size rel base flavor where="" rc
+
+  if [[ ! -d $boot ]]; then
+    printf 'unavailable (no %s)\n' "$boot"
+    return 0
+  fi
+
+  # One pass over /boot: images holds every kernel/initrd file and kernels the
+  # vmlinuz subset, so the count, size, and version tally all derive from the
+  # same scan instead of three separate finds.
+  while IFS= read -r f; do
+    images+=("$f")
+    [[ $f == vmlinuz-* ]] && kernels+=("$f")
+  done < <(find "$boot" -maxdepth 1 -type f \
+    \( -name 'vmlinuz-*' -o -name 'initrd.img-*' \) -printf '%f\n' 2>/dev/null | sort)
+
+  files="${#images[@]}"
+  if ((files == 0)); then
+    printf 'none in %s\n' "$boot"
+    return 0
+  fi
+
+  size="$(du -ch -- "${images[@]/#/$boot/}" 2>/dev/null | tail -1 | cut -f1 || true)"
+  for f in "${kernels[@]}"; do
+    rel="${f#vmlinuz-}"
+    flavor="$(kernel_flavor "$rel")"
+    base="$rel"
+    if [[ -n $flavor && $rel == *"$flavor" ]]; then
+      base="${rel%"$flavor"}"
+      base="${base%[+-]}"
+    fi
+    versions["$base"]=1
+  done
+
+  if is_mountpoint "$boot"; then
+    where=""
+  else
+    rc=$?
+    if ((rc == MOUNT_STATUS_UNKNOWN)); then
+      where=" (mount unknown)"
+    else
+      where=" (on /)"
+    fi
+  fi
+  printf '%s versions, %s images, %s in %s%s\n' \
+    "${#versions[@]}" "${#kernels[@]}" "${size:-?}" "$boot" "$where"
+}
+
+# World-writable files in a package cache or a user's home are noise: uv's
+# lock files are deliberately 0666 and there are hundreds of them. Count them
+# so the total matches find, but report the number outside those trees, which
+# is the part that can be acted on.
+world_writable_is_noise() {
+  case "$1" in
+    /home/*|/root/*|/tmp/*|/var/tmp/*|/dev/shm/*|/var/cache/*|/var/lib/docker/*|/var/lib/containerd/*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+world_writable_summary() {
+  local tmp total=0 f
+  local -a outside=()
+  tmp="$(mktemp "${TMPDIR:-/tmp}/shippi-ww.XXXXXX")" || {
+    printf 'unavailable (could not create a temp file)\n'
+    return 0
+  }
+  # A timeout leaves a partial list, and a partial count is worse than an
+  # explicit "not scanned": the old pipeline printed wc's 0 when find never
+  # ran, which read as a clean bill of health on a box that was never scanned.
+  if ! peek timeout 60 find / -xdev -type f -perm -002 2>/dev/null >"$tmp"; then
+    rm -f "$tmp"
+    printf 'not scanned (needs root or timed out)\n'
+    return 0
+  fi
+  while IFS= read -r f; do
+    total=$((total + 1))
+    if ! world_writable_is_noise "$f"; then
+      outside+=("$f")
+    fi
+  done <"$tmp"
+  rm -f "$tmp"
+
+  if ((${#outside[@]} == 0)); then
+    printf '%s total, 0 outside home/cache/tmp/containers\n' "$total"
+  else
+    local IFS=' '
+    printf '%s total, %s outside home/cache/tmp/containers: %s\n' \
+      "$total" "${#outside[@]}" "${outside[*]:0:3}"
+  fi
+}
+
+# The closing line used to be an unexplained claim. Derive it from the same
+# numbers the table printed, so a healthy box says so and a full one names
+# the mount and the consequence.
+mount_pressure_summary() {
+  local i m stats size used avail pcent fstype avail_kb boot_low_free=0 w free_text=""
+  local -a free=() warnings=() failed=()
+  for i in "${!MOUNT_PATH[@]}"; do
+    m="${MOUNT_PATH[$i]}"
+    stats="${MOUNT_STATS[$i]}"
+    if [[ -z $stats ]]; then
+      failed+=("$m")
+      continue
+    fi
+    read -r size used avail pcent fstype avail_kb <<<"$stats"
+    free+=("${avail} free on ${m}")
+    if disk_mount_warn "$m" "$pcent" "$avail_kb"; then
+      warnings+=("${m} has ${avail} free (${pcent} used)")
+      if disk_mount_low_free "$m" "$avail_kb"; then
+        boot_low_free=1
+      fi
+    fi
+  done
+
+  printf '\n'
+  if ((${#failed[@]})); then
+    printf '  Disk pressure unknown: could not measure %s.\n' "${failed[*]}"
+  fi
+  if ((${#warnings[@]})); then
+    for w in "${warnings[@]}"; do
+      printf '  WARN: %s\n' "$w"
+    done
+    if ((boot_low_free)); then
+      printf '  A kernel package needs about %sM, so apt may fail the kernel\n' \
+        "$KERNEL_PKG_NEEDS_MB"
+      printf '  step, keep the old kernel, and silently stop receiving fixes.\n'
+    fi
+  elif ((${#failed[@]} == 0)); then
+    for w in "${free[@]}"; do
+      free_text+="${free_text:+, }$w"
+    done
+    printf '  No disk pressure: %s.\n' "${free_text:-no mounts measured}"
+  fi
+}
+
+# Hardening-relevant storage checks only: boot/root pressure, accumulated
+# kernel images, world-writable files, and the verdict. Capacity details such
+# as inode use, journal cap, and apt cache are out of scope here.
+audit_storage() {
+  collect_storage_mounts
+  audit_mount_table
+  printf '\n'
+  printf '  %-14s %s\n' kernels "$(boot_kernel_summary)"
+  printf '  %-14s %s\n' "world-writable" "$(world_writable_summary)"
+  mount_pressure_summary
+}
+
 audit_system_health() {
   local failed newest krel
   krel="$(uname -r 2>/dev/null || printf '?')"
@@ -4171,16 +4458,8 @@ audit() {
       grep -ciE 'failed|invalid|refused' |
       awk '{print "  ssh failures in 24h: " $1}' || true
 
-    heading "filesystem"
-    printf '  %s\n' "$(peek df -h / 2>/dev/null | tail -1 || true)"
-    # timeout must go inside peek, not around it: timeout execs an external
-    # program and cannot run a shell function, so `timeout 60 peek find ...`
-    # always failed with exit 127 and the audit reported "world-writable
-    # files: 0" on a box it never actually scanned.
-    printf '  world-writable files: %s\n' \
-      "$(peek timeout 60 find / -xdev -type f -perm -002 2>/dev/null | wc -l || echo 'not scanned')"
-
-    printf '\n disk space on the boot filesystem matters \n'
+    heading "filesystem & storage"
+    audit_storage
   } 2>&1 | tee "$AUDIT_TMP"
 
   if ((WANT_REPORT)); then

@@ -3102,8 +3102,10 @@ test_audit_timeout_is_inside_peek() {
   # and peek is a shell function, so it always exited 127 and the audit
   # reported "world-writable files: 0" on a box it never scanned.
   local body rc=0
-  body="$_ORIGINAL_AUDIT"
+  body="$(declare -f world_writable_summary)"
   [[ $body == *"peek timeout 60 find"* ]] || rc=1
+  [[ $body != *"timeout 60 peek"* ]] || rc=1
+  body="$(declare -f audit)"
   [[ $body != *"timeout 60 peek"* ]] || rc=1
   return $rc
 }
@@ -3136,8 +3138,328 @@ test_audit_hints_show_where_to_edit() {
   [[ $body == *'config_hint /etc/ssh'* ]] || rc=1
   [[ $body == *'config_hint /etc/fail2ban'* ]] || rc=1
   [[ $body == *'config_hint /etc/sysctl.d'* ]] || rc=1
+  [[ $body == *'heading "filesystem & storage"'* ]] || rc=1
+  [[ $body != *'disk space on the boot filesystem matters'* ]] || rc=1
   [[ $body == *'heading "apparmor"'* ]] || rc=1
   [[ $body != *'heading "apparmour"'* ]] || rc=1
+  return $rc
+}
+
+test_storage_mounts_keeps_unmeasurable_mounts() {
+  setup_destdir
+  local rc=0 out
+  stub is_mountpoint
+  is_mountpoint() { return 2; }
+  out="$(storage_mounts)"
+  assert_eq "$out" $'/\n/boot\n/boot/firmware' || rc=1
+
+  is_mountpoint() { return 1; }
+  out="$(storage_mounts)"
+  assert_eq "$out" "/" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_is_mountpoint_reports_unknown_on_df_failure() {
+  setup_destdir
+  local rc=0 d
+  d="$(mktemp -d)"
+  stub df
+  df() { return 1; }
+  is_mountpoint "$d"
+  assert_eq "$?" "2" || rc=1
+  rm -rf "$d"
+  teardown_destdir
+  return $rc
+}
+
+test_audit_mount_table_marks_boot_pressure() {
+  setup_destdir
+  local rc=0 out
+  stub storage_mounts
+  storage_mounts() { printf '/\n/boot/firmware\n'; }
+  stub mount_stats
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '510M 67M 444M 13%% vfat 454424\n' ;;
+    esac
+  }
+
+  collect_storage_mounts
+  out="$(audit_mount_table)"
+  assert_contains "$out" "Mount" || rc=1
+  assert_contains "$out" "/boot/firmware   vfat" || rc=1
+  assert_contains "$out" "422G" || rc=1
+  if [[ $out == *WARN* ]]; then
+    printf '        a healthy boot filesystem was marked as pressure\n'
+    rc=1
+  fi
+
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '510M 489M 21M 97%% vfat 21504\n' ;;
+    esac
+  }
+  collect_storage_mounts
+  out="$(audit_mount_table)"
+  assert_contains "$out" "97%" || rc=1
+  assert_contains "$out" "WARN" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_root_filesystem_never_warned() {
+  setup_destdir
+  local rc=0 out
+  stub storage_mounts
+  storage_mounts() { printf '/\n'; }
+  stub mount_stats
+  mount_stats() { printf '470G 446G 24G 95%% ext4 25165824\n'; }
+
+  # The 90% rule is for boot mounts; a full root filesystem is reported but
+  # not flagged, matching the spec's "boot mounts warn ... at 90% used".
+  collect_storage_mounts
+  out="$(audit_mount_table)"
+  assert_contains "$out" "95%" || rc=1
+  if assert_contains "$out" "WARN"; then rc=1; fi
+
+  collect_storage_mounts
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "No disk pressure: 24G free on /" || rc=1
+  if assert_contains "$out" "WARN"; then rc=1; fi
+  teardown_destdir
+  return $rc
+}
+
+test_audit_storage_verdict_names_the_consequence() {
+  setup_destdir
+  local rc=0 out
+  stub storage_mounts
+  storage_mounts() { printf '/\n/boot/firmware\n'; }
+  stub mount_stats
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '510M 67M 444M 13%% vfat 454424\n' ;;
+    esac
+  }
+
+  collect_storage_mounts
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "No disk pressure: 422G free on /, 444M free on /boot/firmware" || rc=1
+
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '510M 489M 21M 97%% vfat 21504\n' ;;
+    esac
+  }
+  collect_storage_mounts
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "WARN: /boot/firmware has 21M free (97% used)" || rc=1
+  assert_contains "$out" "kernel package needs about 25M" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_audit_storage_verdict_distinguishes_floor_from_percentage() {
+  setup_destdir
+  local rc=0 out
+  stub storage_mounts
+  storage_mounts() { printf '/\n/boot/firmware\n'; }
+  stub mount_stats
+
+  # 82% used but only 91M free: the absolute floor is breached.
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '510M 419M 91M 82%% vfat 93184\n' ;;
+    esac
+  }
+  collect_storage_mounts
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "WARN: /boot/firmware has 91M free (82% used)" || rc=1
+  assert_contains "$out" "kernel package needs about 25M" || rc=1
+  assert_contains "$out" "apt may fail the kernel" || rc=1
+  if assert_contains "$out" "apt will fail"; then rc=1; fi
+
+  # 91% used but 900M free: percentage rule only, so no apt-failure claim.
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      /boot/firmware) printf '20G 18.2G 900M 91%% ext4 921600\n' ;;
+    esac
+  }
+  collect_storage_mounts
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "WARN: /boot/firmware has 900M free (91% used)" || rc=1
+  if assert_contains "$out" "kernel package needs about 25M"; then rc=1; fi
+  teardown_destdir
+  return $rc
+}
+
+test_audit_storage_verdict_not_healthy_when_mount_unmeasured() {
+  setup_destdir
+  local rc=0 out
+  stub storage_mounts
+  storage_mounts() { printf '/\n/boot/firmware\n'; }
+  stub mount_stats
+  mount_stats() {
+    case "$1" in
+      /) printf '470G 24G 422G 6%% ext4 442166348\n' ;;
+      *) return 1 ;;
+    esac
+  }
+
+  collect_storage_mounts
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "Disk pressure unknown: could not measure /boot/firmware" || rc=1
+  if assert_contains "$out" "No disk pressure"; then rc=1; fi
+
+  mount_stats() { return 1; }
+  collect_storage_mounts
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "Disk pressure unknown: could not measure / /boot/firmware" || rc=1
+  if assert_contains "$out" "No disk pressure"; then rc=1; fi
+  if assert_contains "$out" "No disk pressure: ."; then rc=1; fi
+  teardown_destdir
+  return $rc
+}
+
+test_boot_kernel_summary_counts_versions_and_images() {
+  setup_destdir
+  local rc=0 t out
+  t="$(mktemp -d)"
+  : >"$t/vmlinuz-6.12.109+rpt-rpi-2712"
+  : >"$t/vmlinuz-6.12.109+rpt-rpi-v8"
+  : >"$t/vmlinuz-6.12.115+rpt-rpi-2712"
+  : >"$t/vmlinuz-6.12.115+rpt-rpi-v8"
+  : >"$t/initrd.img-6.12.109+rpt-rpi-2712"
+  : >"$t/initrd.img-6.12.109+rpt-rpi-v8"
+  : >"$t/initrd.img-6.12.115+rpt-rpi-2712"
+  : >"$t/initrd.img-6.12.115+rpt-rpi-v8"
+
+  out="$(SHIPPI_BOOT_DIR="$t" boot_kernel_summary)"
+  assert_contains "$out" "2 versions, 4 images" || rc=1
+  assert_contains "$out" "in $t" || rc=1
+
+  rm -rf "$t"
+  t="$(mktemp -d)"
+  out="$(SHIPPI_BOOT_DIR="$t" boot_kernel_summary)"
+  assert_contains "$out" "none in $t" || rc=1
+  rm -rf "$t"
+  teardown_destdir
+  return $rc
+}
+
+test_boot_kernel_summary_reports_unknown_mount() {
+  setup_destdir
+  local rc=0 t out
+  t="$(mktemp -d)"
+  : >"$t/vmlinuz-6.12.109+rpt-rpi-2712"
+  : >"$t/initrd.img-6.12.109+rpt-rpi-2712"
+
+  stub is_mountpoint
+  # A failed df query must not read as "on /": that claims a relationship
+  # that was never measured.
+  is_mountpoint() { return 2; }
+  out="$(SHIPPI_BOOT_DIR="$t" boot_kernel_summary)"
+  assert_contains "$out" "(mount unknown)" || rc=1
+  if assert_contains "$out" "(on /)"; then rc=1; fi
+
+  is_mountpoint() { return 1; }
+  out="$(SHIPPI_BOOT_DIR="$t" boot_kernel_summary)"
+  assert_contains "$out" "(on /)" || rc=1
+  if assert_contains "$out" "(mount unknown)"; then rc=1; fi
+
+  rm -rf "$t"
+  teardown_destdir
+  return $rc
+}
+
+test_mount_stats_forces_kib() {
+  setup_destdir
+  local rc=0 out
+  stub df
+  df() {
+    case "$*" in
+      *-k*--output=avail*) printf 'AVAIL\n442484696\n' ;;
+      *--output=avail*) printf 'AVAIL\n432114\n' ;;
+      *--output=size*) printf '470G 24G 422G 6%% ext4\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  out="$(mount_stats /)"
+  assert_eq "${out##* }" "442484696" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_mount_stats_trims_df_padding() {
+  setup_destdir
+  local rc=0 out
+  stub df
+  df() {
+    case "$*" in
+      *-k*--output=avail*) printf 'AVAIL\n 4096\n' ;;
+      *--output=size*) printf '470G 24G 422G 6%% ext4\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  out="$(mount_stats /)"
+  assert_eq "${out##* }" "4096" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_mount_stats_rejects_failed_numeric_query() {
+  setup_destdir
+  local rc=0 out
+  stub df
+  df() {
+    case "$*" in
+      *-k*--output=avail*) return 1 ;;
+      *--output=size*) printf '470G 24G 422G 6%% ext4\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  if out="$(mount_stats /)"; then rc=1; fi
+  assert_eq "$out" "" || rc=1
+
+  # A successful but empty numeric query must fail the same way.
+  df() {
+    case "$*" in
+      *-k*--output=avail*) return 0 ;;
+      *--output=size*) printf '470G 24G 422G 6%% ext4\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  if out="$(mount_stats /)"; then rc=1; fi
+  assert_eq "$out" "" || rc=1
+  teardown_destdir
+  return $rc
+}
+
+test_world_writable_summary_excludes_user_caches() {
+  setup_destdir
+  local rc=0 out
+  stub peek
+  peek() {
+    printf '%s\n' \
+      /home/woodcox/.cache/uv/a.lock \
+      /home/woodcox/.hermes/cache/uv/b.lock \
+      /tmp/c \
+      /usr/local/bin/bad
+  }
+  out="$(world_writable_summary)"
+  assert_eq "$out" "4 total, 1 outside home/cache/tmp/containers: /usr/local/bin/bad" || rc=1
+
+  peek() { return 124; }
+  out="$(world_writable_summary)"
+  assert_eq "$out" "not scanned (needs root or timed out)" || rc=1
+  teardown_destdir
   return $rc
 }
 
@@ -4806,6 +5128,19 @@ t 'newest installed kernel is version-sorted'           test_newest_installed_ke
 t 'failed units returns unit names only'                test_failed_systemd_units_returns_unit_names
 t 'audit timeout is inside peek'                        test_audit_timeout_is_inside_peek
 t 'audit hints point at config files'                   test_audit_hints_show_where_to_edit
+t 'storage table flags a full boot filesystem'          test_audit_mount_table_marks_boot_pressure
+t 'storage never warns on a full root filesystem'       test_root_filesystem_never_warned
+t 'storage keeps mounts it cannot measure'              test_storage_mounts_keeps_unmeasurable_mounts
+t 'is_mountpoint reports unknown on df failure'         test_is_mountpoint_reports_unknown_on_df_failure
+t 'storage verdict explains boot pressure'              test_audit_storage_verdict_names_the_consequence
+t 'storage verdict separates floor from percentage'     test_audit_storage_verdict_distinguishes_floor_from_percentage
+t 'storage counts kernel versions and images'           test_boot_kernel_summary_counts_versions_and_images
+t 'storage reports an unmeasurable boot mount'          test_boot_kernel_summary_reports_unknown_mount
+t 'storage forces KiB for pressure checks'              test_mount_stats_forces_kib
+t 'storage trims df column padding'                     test_mount_stats_trims_df_padding
+t 'storage rejects a failed numeric df query'           test_mount_stats_rejects_failed_numeric_query
+t 'storage filters world-writable cache noise'          test_world_writable_summary_excludes_user_caches
+t 'storage verdict is unknown when a mount fails'       test_audit_storage_verdict_not_healthy_when_mount_unmeasured
 t 'audit is offered after the run'                      test_audit_prompt_offered_after_main_output
 t 'declining the audit runs nothing'                    test_audit_prompt_declined_runs_nothing
 t '--audit and --yes skip the audit prompt'             test_audit_flag_and_yes_skip_the_prompt

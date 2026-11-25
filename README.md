@@ -30,6 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/woodcox/shippi-server/main/install.
 - **Optional productivity tools**: [tuiboard](https://tuiboard.nazzareno.xyz/), a terminal kanban on plain markdown, and [hunk](https://hunk.dev/), a terminal diff viewer (both installed with Bun)
 - **Networking**: SSH, tailscale
 - **Git**: Interactive config for user name/email, helpful aliases
+- **Browser**: w3m is a simple text-based broswer
 
 ## Interactive prompts
 

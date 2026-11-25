@@ -17,7 +17,7 @@ install_packages() {
     build-essential openssh-server
     fzf zoxide btop jq
     gpg kitty-terminfo
-    unzip fontconfig
+    unzip fontconfig w3m
     # bat backs the `ff`/`sff` fuzzy finders, parted + exfatprogs back
     # `format-drive`. Debian installs the bat binary as `batcat`, which
     # config/shell/aliases resolves for.

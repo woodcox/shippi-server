@@ -4252,9 +4252,9 @@ mount_pressure_summary() {
   fi
 }
 
-# Hardening-relevant storage checks only. Capacity details live in the opt-in
-# status task, so the audit stays about what can silently stop security
-# updates or expose the box.
+# Hardening-relevant storage checks only: boot/root pressure, accumulated
+# kernel images, world-writable files, and the verdict. Capacity details such
+# as inode use, journal cap, and apt cache are out of scope here.
 audit_storage() {
   collect_storage_mounts
   audit_mount_table

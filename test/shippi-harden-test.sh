@@ -3331,6 +3331,31 @@ test_boot_kernel_summary_counts_versions_and_images() {
   return $rc
 }
 
+test_boot_kernel_summary_reports_unknown_mount() {
+  setup_destdir
+  local rc=0 t out
+  t="$(mktemp -d)"
+  : >"$t/vmlinuz-6.12.109+rpt-rpi-2712"
+  : >"$t/initrd.img-6.12.109+rpt-rpi-2712"
+
+  stub is_mountpoint
+  # A failed df query must not read as "on /": that claims a relationship
+  # that was never measured.
+  is_mountpoint() { return 2; }
+  out="$(SHIPPI_BOOT_DIR="$t" boot_kernel_summary)"
+  assert_contains "$out" "(mount unknown)" || rc=1
+  if assert_contains "$out" "(on /)"; then rc=1; fi
+
+  is_mountpoint() { return 1; }
+  out="$(SHIPPI_BOOT_DIR="$t" boot_kernel_summary)"
+  assert_contains "$out" "(on /)" || rc=1
+  if assert_contains "$out" "(mount unknown)"; then rc=1; fi
+
+  rm -rf "$t"
+  teardown_destdir
+  return $rc
+}
+
 test_mount_stats_forces_kib() {
   setup_destdir
   local rc=0 out
@@ -5086,6 +5111,7 @@ t 'is_mountpoint reports unknown on df failure'         test_is_mountpoint_repor
 t 'storage verdict explains boot pressure'              test_audit_storage_verdict_names_the_consequence
 t 'storage verdict separates floor from percentage'     test_audit_storage_verdict_distinguishes_floor_from_percentage
 t 'storage counts kernel versions and images'           test_boot_kernel_summary_counts_versions_and_images
+t 'storage reports an unmeasurable boot mount'          test_boot_kernel_summary_reports_unknown_mount
 t 'storage forces KiB for pressure checks'              test_mount_stats_forces_kib
 t 'storage trims df column padding'                     test_mount_stats_trims_df_padding
 t 'storage rejects a failed numeric df query'           test_mount_stats_rejects_failed_numeric_query

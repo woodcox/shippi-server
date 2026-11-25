@@ -4112,7 +4112,7 @@ boot_kernel_summary() {
   local boot="${SHIPPI_BOOT_DIR:-/boot}"
   local -a kernels=()
   local -A versions=()
-  local f files size rel base flavor where=""
+  local f files size rel base flavor where="" rc
 
   if [[ ! -d $boot ]]; then
     printf 'unavailable (no %s)\n' "$boot"
@@ -4145,7 +4145,16 @@ boot_kernel_summary() {
     versions["$base"]=1
   done
 
-  is_mountpoint "$boot" || where=" (on /)"
+  if is_mountpoint "$boot"; then
+    where=""
+  else
+    rc=$?
+    if ((rc == 2)); then
+      where=" (mount unknown)"
+    else
+      where=" (on /)"
+    fi
+  fi
   printf '%s versions, %s images, %s in %s%s\n' \
     "${#versions[@]}" "${#kernels[@]}" "${size:-?}" "$boot" "$where"
 }

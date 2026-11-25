@@ -4055,11 +4055,13 @@ disk_mount_low_free() {
   [[ $m != / && $avail_kb =~ ^[0-9]+$ ]] && ((avail_kb < BOOT_MIN_FREE_KB))
 }
 
-# True when a mount deserves a WARN. Every mount gets the 90% rule; the boot
-# mounts also get the absolute floor, because 90% of a 510M partition is
-# still 51M free, which is not enough for a kernel package.
+# True when a boot mount deserves a WARN. Only /boot and /boot/firmware are
+# warned: they get the 90% rule plus the absolute floor, because 90% of a
+# 510M partition is still 51M free, which is not enough for a kernel package.
+# The root filesystem is reported in the table but never warned.
 disk_mount_warn() {
   local m="$1" pcent="${2%\%}" avail_kb="$3"
+  [[ $m != / ]] || return 1
   if [[ $pcent =~ ^[0-9]+$ ]] && ((pcent >= 90)); then
     return 0
   fi

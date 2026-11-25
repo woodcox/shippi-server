@@ -3210,6 +3210,29 @@ test_audit_mount_table_marks_boot_pressure() {
   return $rc
 }
 
+test_root_filesystem_never_warned() {
+  setup_destdir
+  local rc=0 out
+  stub storage_mounts
+  storage_mounts() { printf '/\n'; }
+  stub mount_stats
+  mount_stats() { printf '470G 446G 24G 95%% ext4 25165824\n'; }
+
+  # The 90% rule is for boot mounts; a full root filesystem is reported but
+  # not flagged, matching the spec's "boot mounts warn ... at 90% used".
+  collect_storage_mounts
+  out="$(audit_mount_table)"
+  assert_contains "$out" "95%" || rc=1
+  if assert_contains "$out" "WARN"; then rc=1; fi
+
+  collect_storage_mounts
+  out="$(mount_pressure_summary)"
+  assert_contains "$out" "No disk pressure: 24G free on /" || rc=1
+  if assert_contains "$out" "WARN"; then rc=1; fi
+  teardown_destdir
+  return $rc
+}
+
 test_audit_storage_verdict_names_the_consequence() {
   setup_destdir
   local rc=0 out
@@ -5106,6 +5129,7 @@ t 'failed units returns unit names only'                test_failed_systemd_unit
 t 'audit timeout is inside peek'                        test_audit_timeout_is_inside_peek
 t 'audit hints point at config files'                   test_audit_hints_show_where_to_edit
 t 'storage table flags a full boot filesystem'          test_audit_mount_table_marks_boot_pressure
+t 'storage never warns on a full root filesystem'       test_root_filesystem_never_warned
 t 'storage keeps mounts it cannot measure'              test_storage_mounts_keeps_unmeasurable_mounts
 t 'is_mountpoint reports unknown on df failure'         test_is_mountpoint_reports_unknown_on_df_failure
 t 'storage verdict explains boot pressure'              test_audit_storage_verdict_names_the_consequence

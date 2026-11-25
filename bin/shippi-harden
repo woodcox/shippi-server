@@ -4471,7 +4471,7 @@ audit() {
       grep -ciE 'failed|invalid|refused' |
       awk '{print "  ssh failures in 24h: " $1}' || true
 
-    heading "filesystem & storage"
+    heading "filesystem"
     audit_storage
   } 2>&1 | tee "$AUDIT_TMP"
 

@@ -3991,6 +3991,10 @@ newest_installed_kernel() {
 # update fitting, not a round percentage, so the table and the verdict use the
 # same number.
 BOOT_MIN_FREE_KB=102400
+# Rough size of one kernel package. Distinct from the floor above: the 100M
+# floor is conservative headroom for a few packages plus initrd/firmware, while
+# this is the number the warning quotes to explain why space matters.
+KERNEL_PKG_NEEDS_MB=25
 
 # True when $1 is a mountpoint in its own right. /boot is a directory on / on
 # a Pi 5 (Bookworm moved the firmware to /boot/firmware), but it is the vfat
@@ -4223,7 +4227,8 @@ mount_pressure_summary() {
       printf '  WARN: %s\n' "$w"
     done
     if ((boot_low_free)); then
-      printf '  A kernel package needs about 25M, so apt may fail the kernel\n'
+      printf '  A kernel package needs about %sM, so apt may fail the kernel\n' \
+        "$KERNEL_PKG_NEEDS_MB"
       printf '  step, keep the old kernel, and silently stop receiving fixes.\n'
     fi
   elif ((${#failed[@]} == 0)); then

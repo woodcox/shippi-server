@@ -1,6 +1,6 @@
 # Shippi-server
 
-A minimal setup for debian based systems like Raspberry Pi OS Lite and Ubuntu in the spirit of Omarchy/[Omaterm](https://github.com/omacom-io/omaterm). This has only been tested on a Raspberry Pi 5 with 8GB ram and SSD storage.
+An opinionated bare metal setup for debian based systems like Raspberry Pi OS Lite and Ubuntu. This has only been tested on a Raspberry Pi 5 with 8GB ram and SSD storage.
 
 ## Requirements
 

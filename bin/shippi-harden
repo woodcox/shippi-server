@@ -3995,17 +3995,22 @@ BOOT_MIN_FREE_KB=102400
 # floor is conservative headroom for a few packages plus initrd/firmware, while
 # this is the number the warning quotes to explain why space matters.
 KERNEL_PKG_NEEDS_MB=25
+# is_mountpoint() return status when df cannot answer, as distinct from 0 ("is
+# a mount") and 1 ("is not a mount"). Callers report it as unknown rather than
+# silently dropping the mount.
+MOUNT_STATUS_UNKNOWN=2
 
 # True when $1 is a mountpoint in its own right. /boot is a directory on / on
 # a Pi 5 (Bookworm moved the firmware to /boot/firmware), but it is the vfat
 # boot partition itself on older layouts. Both need looking at; a path
-# existing is not enough to tell which one this is. Returns 2 when df cannot
-# answer, so callers can report unknown instead of silently dropping a mount.
+# existing is not enough to tell which one this is. Returns MOUNT_STATUS_UNKNOWN
+# when df cannot answer, so callers can report unknown instead of silently
+# dropping a mount.
 is_mountpoint() {
   local target
   [[ -d $1 ]] || return 1
   target="$(LC_ALL=C df --output=target -- "$1" 2>/dev/null | tail -1)"
-  [[ -n $target ]] || return 2
+  [[ -n $target ]] || return "$MOUNT_STATUS_UNKNOWN"
   [[ $target == "$1" ]]
 }
 
@@ -4022,7 +4027,7 @@ storage_mounts() {
     else
       rc=$?
     fi
-    if ((rc == 0 || rc == 2)); then
+    if ((rc == 0 || rc == MOUNT_STATUS_UNKNOWN)); then
       printf '%s\n' "$m"
     fi
   done
@@ -4153,7 +4158,7 @@ boot_kernel_summary() {
     where=""
   else
     rc=$?
-    if ((rc == 2)); then
+    if ((rc == MOUNT_STATUS_UNKNOWN)); then
       where=" (mount unknown)"
     else
       where=" (on /)"

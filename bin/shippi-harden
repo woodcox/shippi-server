@@ -4620,8 +4620,17 @@ main() {
   want_task sysctl && configure_sysctl
   want_task aide && configure_aide
 
-  want_task audit && ((RUN_AUDIT)) && audit
-  manual_followups
+  # An explicit `audit` on the command line - or --audit - runs the audit
+  # here. RUN_AUDIT=0 keeps it out of the default hardening path; the
+  # end-of-run offer below covers that instead.
+  want_task audit && ((RUN_AUDIT || ${#SELECTED[@]} > 0)) && audit
+
+  # The follow-up list belongs to a hardening run. A bare `shippi-harden
+  # audit` is a query whose output is the audit itself, so the list is noise
+  # there.
+  if ((${#SELECTED[@]} != 1)) || [[ ${SELECTED[0]-} != audit ]]; then
+    manual_followups
+  fi
 
   if ((DRY_RUN)); then
     printf '\n%s   dry run. Re-run without --dry-run when this looks right.%s\n' "$C_DIM" "$C_OFF"
@@ -4630,8 +4639,10 @@ main() {
   # The audit is read-only and immediately useful after a hardening run, but
   # RUN_AUDIT=0 keeps it out of the default path. Offer it at the end instead
   # of making the user re-run with --audit. --yes and --dry-run stay
-  # noninteractive, and a task list that leaves audit out is honoured.
-  if want_task audit && ((!RUN_AUDIT)) && ((!DRY_RUN)) && ((!ASSUME_YES)); then
+  # noninteractive; a task list that leaves audit out is honoured, and one
+  # that names audit has already run it above.
+  if want_task audit && ((!RUN_AUDIT)) && ((${#SELECTED[@]} == 0)) &&
+    ((!DRY_RUN)) && ((!ASSUME_YES)); then
     if ask "run the security audit now?" n; then
       audit
     fi

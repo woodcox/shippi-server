@@ -3506,10 +3506,18 @@ test_world_writable_summary_excludes_user_caches() {
   return $rc
 }
 
-# main() with the audit task selected and every other task disabled, so the
-# prompt's control flow can be exercised without touching the host. The test
-# functions below replace banner/ask/audit/manual_followups and stub have() to
-# false, which also stops main's sudo warm-up.
+# main() with every task stubbed out, so the end-of-run audit offer can be
+# exercised without touching the host. The test functions below replace
+# banner/ask/audit/manual_followups and stub have() to false, which also
+# stops main's sudo warm-up. SELECTED starts empty, i.e. the default run;
+# tests that need a specific task list set it themselves.
+#
+# configure_password_quality is deliberately NOT stubbed. Its body contains
+# a heredoc, and bash's declare -f round-trip re-parses a heredoc that sits
+# inside a compound command: the restore silently moves a `return 0` above
+# the warn it belongs with, rewriting the function - exactly the leak the
+# stub tracker below exists to catch. Stubbing have_pwquality instead makes
+# the real function return at its first guard.
 stub_main_audit() {
   stub banner
   banner() { :; }
@@ -3520,15 +3528,58 @@ stub_main_audit() {
   stub manual_followups
   manual_followups() { printf 'FOLLOWUPS-PRINTED\n'; }
   stub ask
-  SELECTED=(audit)
+  stub have_pwquality
+  have_pwquality() { return 1; }
+  local f
+  for f in install_hardening_packages check_users configure_services \
+           harden_ssh configure_firewall configure_fail2ban \
+           configure_updates configure_apparmor configure_sysctl configure_aide; do
+    stub "$f"
+    eval "$f() { :; }"
+  done
+  SELECTED=()
   DRY_RUN=0
   ASSUME_YES=0
 }
 
+test_audit_task_runs_without_prompt_or_followups() {
+  # A bare `shippi-harden audit` is a query: the audit runs immediately and
+  # is the whole output. No follow-up list, and no offer asking whether to
+  # run the thing that was just asked for.
+  setup_destdir
+  local rc=0 out
+  stub_main_audit
+  SELECTED=(audit)
+  ask() { printf 'AUDIT-PROMPT\n'; return 0; }
+  RUN_AUDIT=0
+
+  out="$(main 2>&1)"
+  [[ $out == *"AUDIT-RAN"* ]] || {
+    printf '        the audit did not run\n'
+    rc=1
+  }
+  [[ $out != *"FOLLOWUPS-PRINTED"* ]] || {
+    printf '        the follow-ups ran for a bare audit query\n'
+    rc=1
+  }
+  [[ $out != *"AUDIT-PROMPT"* ]] || {
+    printf '        a bare audit query was still offered the audit\n'
+    rc=1
+  }
+  [[ $out != *"AUDIT-RAN"*"AUDIT-RAN"* ]] || {
+    printf '        the audit ran twice\n'
+    rc=1
+  }
+  teardown_destdir
+  SELECTED=()
+  RUN_AUDIT=0
+  return $rc
+}
+
 test_audit_prompt_offered_after_main_output() {
-  # RUN_AUDIT=0 keeps the audit out of the run, but the user should get one
-  # last chance to run it after main has printed its follow-ups, and a yes
-  # must actually run the audit.
+  # RUN_AUDIT=0 keeps the audit out of the default run, but the user should
+  # get one last chance to run it after main has printed its follow-ups, and
+  # a yes must actually run the audit.
   setup_destdir
   local rc=0 out
   stub_main_audit
@@ -3568,6 +3619,35 @@ test_audit_prompt_declined_runs_nothing() {
   return $rc
 }
 
+test_task_list_without_audit_skips_offer() {
+  # A task list that leaves audit out is honoured: no audit, and no offer
+  # asking for one. The follow-ups still belong to a hardening run.
+  setup_destdir
+  local rc=0 out
+  stub_main_audit
+  SELECTED=(ssh)
+  ask() { printf 'AUDIT-PROMPT\n'; return 0; }
+  RUN_AUDIT=0
+
+  out="$(main 2>&1)"
+  [[ $out == *"FOLLOWUPS-PRINTED"* ]] || {
+    printf '        the follow-ups did not print for a hardening run\n'
+    rc=1
+  }
+  [[ $out != *"AUDIT-PROMPT"* ]] || {
+    printf '        the audit was offered despite leaving it out of the task list\n'
+    rc=1
+  }
+  [[ $out != *"AUDIT-RAN"* ]] || {
+    printf '        the audit ran despite leaving it out of the task list\n'
+    rc=1
+  }
+  teardown_destdir
+  SELECTED=()
+  RUN_AUDIT=0
+  return $rc
+}
+
 test_audit_flag_and_yes_skip_the_prompt() {
   # --audit is the explicit request, and --yes is documented as
   # noninteractive, so neither may ask. --yes must also leave the default
@@ -3585,6 +3665,10 @@ test_audit_flag_and_yes_skip_the_prompt() {
   }
   [[ $out != *"AUDIT-PROMPT"* ]] || {
     printf '        --audit still prompted\n'
+    rc=1
+  }
+  [[ $out != *"AUDIT-RAN"*"AUDIT-RAN"* ]] || {
+    printf '        --audit ran the audit twice\n'
     rc=1
   }
 
@@ -5184,9 +5268,11 @@ t 'storage trims df column padding'                     test_mount_stats_trims_d
 t 'storage rejects a failed numeric df query'           test_mount_stats_rejects_failed_numeric_query
 t 'storage filters world-writable cache noise'          test_world_writable_summary_excludes_user_caches
 t 'storage verdict is unknown when a mount fails'       test_audit_storage_verdict_not_healthy_when_mount_unmeasured
-t 'audit is offered after the run'                      test_audit_prompt_offered_after_main_output
-t 'declining the audit runs nothing'                    test_audit_prompt_declined_runs_nothing
-t '--audit and --yes skip the audit prompt'             test_audit_flag_and_yes_skip_the_prompt
+t 'a bare audit query runs just the audit'               test_audit_task_runs_without_prompt_or_followups
+t 'audit is offered after a default run'                 test_audit_prompt_offered_after_main_output
+t 'declining the audit runs nothing'                     test_audit_prompt_declined_runs_nothing
+t 'a task list without audit never offers it'            test_task_list_without_audit_skips_offer
+t '--audit and --yes skip the audit prompt'              test_audit_flag_and_yes_skip_the_prompt
 
 t 'the firewall loop visits every port'                 test_firewall_loop_visits_every_port
 t 'the firewall loop skips the ssh port'                test_firewall_skips_the_ssh_port

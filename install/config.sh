@@ -94,5 +94,4 @@ install_bins() {
   echo "✓ shippi-setup"
   echo "✓ shippi-help"
   echo "✓ shippi-harden"
-  echo "✓ shippi-status"
 }

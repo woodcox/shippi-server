@@ -11,7 +11,6 @@ set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$TEST_DIR/bin/shippi-harden"
-STATUS_SCRIPT="$TEST_DIR/bin/shippi-status"
 PASS=0
 FAIL=0
 # Test functions already run, so t() can reject a duplicate registration
@@ -29,10 +28,6 @@ export TMPDIR="$TEST_TMP"
 
 # shellcheck source=../bin/shippi-harden
 source "$SCRIPT"
-# shippi-status reuses the audit's primitives but owns the capacity helpers.
-# Sourcing it here also exercises the no-reexecution guard.
-# shellcheck source=../bin/shippi-status
-source "$STATUS_SCRIPT"
 
 # The sourced script installs an EXIT trap for its audit temp file. Replace it
 # with one that cleans both that file and this suite's private temp root.
@@ -2648,28 +2643,6 @@ test_list_works() {
   out="$(bash "$SCRIPT" --list 2>&1)" || return 1
   assert_contains "$out" "fail2ban" || return 1
   assert_contains "$out" "(opt-in)" || return 1
-  if assert_contains "$out" "status (opt-in)"; then
-    printf '        status should be a separate command, not a task\n'
-    return 1
-  fi
-}
-
-test_status_script_help() {
-  local rc=0 out
-  [[ -x $STATUS_SCRIPT ]] || rc=1
-  out="$(bash "$STATUS_SCRIPT" --help 2>&1)" || rc=1
-  assert_contains "$out" "Usage: shippi-status" || rc=1
-  assert_contains "$out" "Read-only" || rc=1
-  return $rc
-}
-
-test_status_script_rejects_unknown_option() {
-  local rc=0 out status=0
-  out="$(bash "$STATUS_SCRIPT" --bogus 2>&1)"
-  status=$?
-  [[ $status -eq 2 ]] || rc=1
-  assert_contains "$out" "unknown option" || rc=1
-  return $rc
 }
 
 test_bad_task_before_any_change() {
@@ -3323,59 +3296,6 @@ test_audit_storage_verdict_not_healthy_when_mount_unmeasured() {
   return $rc
 }
 
-test_audit_storage_keeps_only_hardening_checks() {
-  setup_destdir
-  local rc=0 out gone
-  stub audit_mount_table
-  audit_mount_table() { printf 'MOUNT-TABLE\n'; }
-  stub boot_kernel_summary
-  boot_kernel_summary() { printf 'KERNELS\n'; }
-  stub world_writable_summary
-  world_writable_summary() { printf 'WORLD-WRITABLE\n'; }
-  stub mount_pressure_summary
-  mount_pressure_summary() { printf 'VERDICT\n'; }
-  stub inode_summary
-  inode_summary() { printf 'INODES\n'; }
-  stub journal_summary
-  journal_summary() { printf 'JOURNAL\n'; }
-  stub apt_cache_summary
-  apt_cache_summary() { printf 'APT-CACHE\n'; }
-  stub docker_disk_summary
-  docker_disk_summary() { printf 'DOCKER\n'; }
-
-  out="$(audit_storage)"
-  assert_contains "$out" "MOUNT-TABLE" || rc=1
-  assert_contains "$out" "KERNELS" || rc=1
-  assert_contains "$out" "WORLD-WRITABLE" || rc=1
-  assert_contains "$out" "VERDICT" || rc=1
-  for gone in INODES JOURNAL APT-CACHE DOCKER; do
-    if assert_contains "$out" "$gone"; then rc=1; fi
-  done
-  teardown_destdir
-  return $rc
-}
-
-test_status_report_shows_capacity_details() {
-  setup_destdir
-  local rc=0 out want
-  stub inode_summary
-  inode_summary() { printf 'INODES\n'; }
-  stub journal_summary
-  journal_summary() { printf 'JOURNAL\n'; }
-  stub apt_cache_summary
-  apt_cache_summary() { printf 'APT-CACHE\n'; }
-  stub docker_disk_summary
-  docker_disk_summary() { printf 'DOCKER\n'; }
-
-  out="$(status_report)"
-  assert_contains "$out" "Storage details" || rc=1
-  for want in INODES JOURNAL APT-CACHE DOCKER; do
-    assert_contains "$out" "$want" || rc=1
-  done
-  teardown_destdir
-  return $rc
-}
-
 test_boot_kernel_summary_counts_versions_and_images() {
   setup_destdir
   local rc=0 t out
@@ -3398,21 +3318,6 @@ test_boot_kernel_summary_counts_versions_and_images() {
   out="$(SHIPPI_BOOT_DIR="$t" boot_kernel_summary)"
   assert_contains "$out" "none in $t" || rc=1
   rm -rf "$t"
-  teardown_destdir
-  return $rc
-}
-
-test_inode_summary_uses_root_filesystem() {
-  setup_destdir
-  local rc=0 out
-  stub df
-  df() { printf 'ITOTAL IUSED IPCT\n30313024 715529 3%%\n'; }
-  out="$(inode_summary)"
-  assert_eq "$out" "/  3% used (716k of 30.3M)" || rc=1
-
-  df() { return 1; }
-  out="$(inode_summary)"
-  assert_eq "$out" "unavailable" || rc=1
   teardown_destdir
   return $rc
 }
@@ -3476,173 +3381,6 @@ test_mount_stats_rejects_failed_numeric_query() {
   }
   if out="$(mount_stats /)"; then rc=1; fi
   assert_eq "$out" "" || rc=1
-  teardown_destdir
-  return $rc
-}
-
-test_journal_summary_reports_cap() {
-  setup_destdir
-  local rc=0 out
-  # journal_summary must elevate: journalctl only sees permission errors when
-  # zero files open, so a direct read can quietly report a subset.
-  stub peek
-  peek() {
-    case "$*" in
-      *--directory=/var/log/journal*) printf 'Archived and active journals take up 139.6M in the file system.\n' ;;
-      *--directory=/run/log/journal*) printf 'Archived and active journals take up 0B in the file system.\n' ;;
-      *) return 1 ;;
-    esac
-  }
-  stub journalctl
-  journalctl() { return 1; }
-  stub journal_max_use
-  journal_max_use() {
-    case "$1" in
-      RuntimeMaxUse) printf '50M\n' ;;
-      *) printf '200M\n' ;;
-    esac
-  }
-  out="$(journal_summary)"
-  assert_eq "$out" "persistent 139.6M of 200M cap (70%)" || rc=1
-
-  # journald.conf accepts a bare byte count for SystemMaxUse.
-  journal_max_use() {
-    case "$1" in
-      RuntimeMaxUse) printf '50M\n' ;;
-      *) printf '209715200\n' ;;
-    esac
-  }
-  peek() {
-    case "$*" in
-      *--directory=/var/log/journal*) printf 'Archived and active journals take up 100M in the file system.\n' ;;
-      *--directory=/run/log/journal*) printf 'Archived and active journals take up 0B in the file system.\n' ;;
-    esac
-  }
-  out="$(journal_summary)"
-  assert_eq "$out" "persistent 100M of 209715200 cap (50%)" || rc=1
-
-  # A leading zero must not turn the byte count into an octal number.
-  journal_max_use() {
-    case "$1" in
-      RuntimeMaxUse) printf '50M\n' ;;
-      *) printf '0209715200\n' ;;
-    esac
-  }
-  out="$(journal_summary)"
-  assert_eq "$out" "persistent 100M of 0209715200 cap (50%)" || rc=1
-
-  journal_max_use() { return 0; }
-  out="$(journal_summary)"
-  assert_eq "$out" "persistent 100M (no explicit cap)" || rc=1
-
-  peek() { return 1; }
-  out="$(journal_summary)"
-  assert_eq "$out" "unavailable" || rc=1
-  teardown_destdir
-  return $rc
-}
-
-test_journal_summary_separates_persistent_and_runtime() {
-  setup_destdir
-  local rc=0 out
-  stub peek
-  peek() {
-    case "$*" in
-      *--directory=/var/log/journal*) printf 'Archived and active journals take up 139.6M in the file system.\n' ;;
-      *--directory=/run/log/journal*) printf 'Archived and active journals take up 8.0M in the file system.\n' ;;
-    esac
-  }
-  stub journal_max_use
-  journal_max_use() {
-    case "$1" in
-      RuntimeMaxUse) printf '50M\n' ;;
-      SystemMaxUse) printf '200M\n' ;;
-    esac
-  }
-  out="$(journal_summary)"
-  assert_eq "$out" "persistent 139.6M of 200M cap (70%); runtime 8.0M of 50M cap (16%)" || rc=1
-
-  # No files in either storage is an empty journal, not an unavailable one.
-  peek() { printf 'Archived and active journals take up 0B in the file system.\n'; }
-  out="$(journal_summary)"
-  assert_eq "$out" "no journal files" || rc=1
-  teardown_destdir
-  return $rc
-}
-
-test_journal_max_use_accepts_spaced_assignment() {
-  setup_destdir
-  local rc=0 out
-  # systemd.syntax(7): whitespace around the '=' is ignored.
-  systemd-analyze() {
-    printf 'SystemMaxUse=200M\n  SystemMaxUse = 100M  \nRuntimeMaxUse = 50M\n'
-  }
-  out="$(journal_max_use)"
-  assert_eq "$out" "100M" || rc=1
-  out="$(journal_max_use RuntimeMaxUse)"
-  assert_eq "$out" "50M" || rc=1
-  unset -f systemd-analyze
-  teardown_destdir
-  return $rc
-}
-
-test_apt_cache_summary_reports_reclaimable() {
-  setup_destdir
-  local rc=0 t out
-  stub peek
-  peek() { "$@"; }
-  t="$(mktemp -d)"
-  printf 'package' >"$t/pkg.deb"
-  out="$(SHIPPI_APT_CACHE_DIR="$t" apt_cache_summary)"
-  assert_contains "$out" "reclaimable" || rc=1
-
-  # A partial du total from a failing run must not be reported as measured.
-  stub du
-  du() { printf '4.0K\t%s\n' "$2"; return 1; }
-  out="$(SHIPPI_APT_CACHE_DIR="$t" apt_cache_summary)"
-  assert_eq "$out" "unavailable" || rc=1
-
-  rm -rf "$t"
-  out="$(SHIPPI_APT_CACHE_DIR="$t" apt_cache_summary)"
-  assert_eq "$out" "none" || rc=1
-  teardown_destdir
-  return $rc
-}
-
-test_docker_disk_summary_separates_logical_and_on_disk() {
-  setup_destdir
-  local rc=0 out
-  stub docker_present
-  docker_present() { return 0; }
-  stub docker
-  docker() {
-    case "$*" in
-      info*) printf '/var/lib/docker\n' ;;
-      system\ df*) printf 'Images\t7.093GB\t5.039GB (71%%)\nContainers\t102.4kB\t0B (0%%)\n' ;;
-    esac
-  }
-  stub peek
-  peek() { printf '1.5G\t/var/lib/docker\n'; }
-
-  out="$(docker_disk_summary)"
-  assert_eq "$out" "1.5G on disk, 7.093GB logical images (5.039GB reclaimable)" || rc=1
-
-  # A sudo user outside the docker group: both direct queries fail, so the
-  # elevated fallback must supply the custom data-root and logical summary.
-  docker() { return 1; }
-  peek() {
-    case "$*" in
-      docker\ info*) printf '/srv/docker\n' ;;
-      docker\ system\ df*) printf 'Images\t2GB\t1GB (50%%)\n' ;;
-      du*) printf '900M\t/srv/docker\n' ;;
-    esac
-  }
-  out="$(docker_disk_summary)"
-  assert_eq "$out" "900M on disk, 2GB logical images (1GB reclaimable)" || rc=1
-
-  docker_present() { return 1; }
-  out="$(docker_disk_summary)"
-  assert_eq "$out" "not running" || rc=1
   teardown_destdir
   return $rc
 }
@@ -5339,24 +5077,14 @@ t 'is_mountpoint reports unknown on df failure'         test_is_mountpoint_repor
 t 'storage verdict explains boot pressure'              test_audit_storage_verdict_names_the_consequence
 t 'storage verdict separates floor from percentage'     test_audit_storage_verdict_distinguishes_floor_from_percentage
 t 'storage counts kernel versions and images'           test_boot_kernel_summary_counts_versions_and_images
-t 'storage reports inode use for /'                     test_inode_summary_uses_root_filesystem
 t 'storage forces KiB for pressure checks'              test_mount_stats_forces_kib
 t 'storage trims df column padding'                     test_mount_stats_trims_df_padding
 t 'storage rejects a failed numeric df query'           test_mount_stats_rejects_failed_numeric_query
-t 'storage reports journal size against its cap'        test_journal_summary_reports_cap
-t 'journal reports persistent and runtime caps'         test_journal_summary_separates_persistent_and_runtime
-t 'journal cap accepts spaces around equals'            test_journal_max_use_accepts_spaced_assignment
-t 'storage reports reclaimable apt cache'               test_apt_cache_summary_reports_reclaimable
-t 'storage separates docker logical and on-disk'        test_docker_disk_summary_separates_logical_and_on_disk
 t 'storage filters world-writable cache noise'          test_world_writable_summary_excludes_user_caches
 t 'storage verdict is unknown when a mount fails'       test_audit_storage_verdict_not_healthy_when_mount_unmeasured
-t 'audit keeps only hardening checks'                   test_audit_storage_keeps_only_hardening_checks
-t 'status reports capacity details'                     test_status_report_shows_capacity_details
 t 'audit is offered after the run'                      test_audit_prompt_offered_after_main_output
 t 'declining the audit runs nothing'                    test_audit_prompt_declined_runs_nothing
 t '--audit and --yes skip the audit prompt'             test_audit_flag_and_yes_skip_the_prompt
-t 'status command shows help'                           test_status_script_help
-t 'status command rejects unknown options'               test_status_script_rejects_unknown_option
 
 t 'the firewall loop visits every port'                 test_firewall_loop_visits_every_port
 t 'the firewall loop skips the ssh port'                test_firewall_skips_the_ssh_port

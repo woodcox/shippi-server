@@ -69,7 +69,6 @@ page_commands() {
   cmd "shippi-setup"   "Set git name, email and GitHub CLI auth"
   cmd "shippi-ssh"     "Add SSH key for remote access"
   cmd "shippi-harden"  "Run the security hardening tool (asks for sudo; try --dry-run first)"
-  cmd "shippi-status"  "Show storage capacity details (inodes, journal, apt cache, Docker)"
 
   section "AI Tools"
   cmd "oc"  "opencode"
@@ -219,7 +218,6 @@ page_hardening() {
   cmd 'shippi-harden --dry-run'       "Print the plan, change nothing"
   cmd 'shippi-harden --yes'           "Take recommended defaults, no hardening prompts"
   cmd 'shippi-harden ssh firewall'    "Just named tasks"
-  cmd 'shippi-status'                 "Capacity details: inodes, journal, apt cache, Docker"
 
   section "Tasks (default: all but aide)"
   cmd "packages"   "hardening tooling: ufw, fail2ban, apparmor, ..."

@@ -3454,7 +3454,7 @@ test_world_writable_summary_excludes_user_caches() {
       /usr/local/bin/bad
   }
   out="$(world_writable_summary)"
-  assert_eq "$out" "4 total, 1 outside home/cache/tmp: /usr/local/bin/bad" || rc=1
+  assert_eq "$out" "4 total, 1 outside home/cache/tmp/containers: /usr/local/bin/bad" || rc=1
 
   peek() { return 124; }
   out="$(world_writable_summary)"

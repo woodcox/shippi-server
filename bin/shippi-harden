@@ -4205,10 +4205,10 @@ world_writable_summary() {
   rm -f "$tmp"
 
   if ((${#outside[@]} == 0)); then
-    printf '%s total, 0 outside home/cache/tmp\n' "$total"
+    printf '%s total, 0 outside home/cache/tmp/containers\n' "$total"
   else
     local IFS=' '
-    printf '%s total, %s outside home/cache/tmp: %s\n' \
+    printf '%s total, %s outside home/cache/tmp/containers: %s\n' \
       "$total" "${#outside[@]}" "${outside[*]:0:3}"
   fi
 }

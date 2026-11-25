@@ -2640,9 +2640,8 @@ test_help_works() {
 
 test_list_works() {
   local out
-  out="$(bash "$SCRIPT" --list 2>&1)" || return 1
-  assert_contains "$out" "fail2ban" || return 1
-  assert_contains "$out" "(opt-in)" || return 1
+  out="$(bash "$SCRIPT" --list 2>&1)" && assert_contains "$out" "fail2ban" &&
+    assert_contains "$out" "(opt-in)"
 }
 
 test_bad_task_before_any_change() {

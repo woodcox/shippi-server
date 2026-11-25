@@ -4062,11 +4062,31 @@ disk_mount_warn() {
   disk_mount_low_free "$m" "$avail_kb"
 }
 
-audit_mount_table() {
-  local m stats size used avail pcent fstype avail_kb mark
-  printf '  %-16s %-5s %5s %5s %6s %5s\n' Mount Type Size Used Avail Use%
+# One df pass per mount, shared by the table and the verdict. Populates the
+# globals _MOUNT_PATH and _MOUNT_STATS in storage_mounts order, where an empty
+# stats string marks a mount whose measurement failed. The table and the
+# verdict both consume the same numbers instead of each re-querying df.
+collect_storage_mounts() {
+  local m stats
+  _MOUNT_PATH=()
+  _MOUNT_STATS=()
   while IFS= read -r m; do
-    if ! stats="$(mount_stats "$m")"; then
+    _MOUNT_PATH+=("$m")
+    if stats="$(mount_stats "$m")"; then
+      _MOUNT_STATS+=("$stats")
+    else
+      _MOUNT_STATS+=("")
+    fi
+  done < <(storage_mounts)
+}
+
+audit_mount_table() {
+  local i m stats size used avail pcent fstype avail_kb mark
+  printf '  %-16s %-5s %5s %5s %6s %5s\n' Mount Type Size Used Avail Use%
+  for i in "${!_MOUNT_PATH[@]}"; do
+    m="${_MOUNT_PATH[$i]}"
+    stats="${_MOUNT_STATS[$i]}"
+    if [[ -z $stats ]]; then
       printf '  %-16s unavailable\n' "$m"
       continue
     fi
@@ -4077,7 +4097,7 @@ audit_mount_table() {
     fi
     printf '  %-16s %-5s %5s %5s %6s %5s%s\n' \
       "$m" "$fstype" "$size" "$used" "$avail" "$pcent" "$mark"
-  done < <(storage_mounts)
+  done
 }
 
 # Kernel versions and images apt has left in /boot. The mount table cannot
@@ -4175,10 +4195,12 @@ world_writable_summary() {
 # numbers the table printed, so a healthy box says so and a full one names
 # the mount and the consequence.
 mount_pressure_summary() {
-  local m stats size used avail pcent fstype avail_kb boot_low_free=0 w free_text=""
+  local i m stats size used avail pcent fstype avail_kb boot_low_free=0 w free_text=""
   local -a free=() warnings=() failed=()
-  while IFS= read -r m; do
-    if ! stats="$(mount_stats "$m")"; then
+  for i in "${!_MOUNT_PATH[@]}"; do
+    m="${_MOUNT_PATH[$i]}"
+    stats="${_MOUNT_STATS[$i]}"
+    if [[ -z $stats ]]; then
       failed+=("$m")
       continue
     fi
@@ -4190,7 +4212,7 @@ mount_pressure_summary() {
         boot_low_free=1
       fi
     fi
-  done < <(storage_mounts)
+  done
 
   printf '\n'
   if ((${#failed[@]})); then
@@ -4216,6 +4238,7 @@ mount_pressure_summary() {
 # status task, so the audit stays about what can silently stop security
 # updates or expose the box.
 audit_storage() {
+  collect_storage_mounts
   audit_mount_table
   printf '\n'
   printf '  %-14s %s\n' kernels "$(boot_kernel_summary)"

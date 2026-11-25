@@ -3186,6 +3186,7 @@ test_audit_mount_table_marks_boot_pressure() {
     esac
   }
 
+  collect_storage_mounts
   out="$(audit_mount_table)"
   assert_contains "$out" "Mount" || rc=1
   assert_contains "$out" "/boot/firmware   vfat" || rc=1
@@ -3201,6 +3202,7 @@ test_audit_mount_table_marks_boot_pressure() {
       /boot/firmware) printf '510M 489M 21M 97%% vfat 21504\n' ;;
     esac
   }
+  collect_storage_mounts
   out="$(audit_mount_table)"
   assert_contains "$out" "97%" || rc=1
   assert_contains "$out" "WARN" || rc=1
@@ -3221,6 +3223,7 @@ test_audit_storage_verdict_names_the_consequence() {
     esac
   }
 
+  collect_storage_mounts
   out="$(mount_pressure_summary)"
   assert_contains "$out" "No disk pressure: 422G free on /, 444M free on /boot/firmware" || rc=1
 
@@ -3230,6 +3233,7 @@ test_audit_storage_verdict_names_the_consequence() {
       /boot/firmware) printf '510M 489M 21M 97%% vfat 21504\n' ;;
     esac
   }
+  collect_storage_mounts
   out="$(mount_pressure_summary)"
   assert_contains "$out" "WARN: /boot/firmware has 21M free (97% used)" || rc=1
   assert_contains "$out" "kernel package needs about 25M" || rc=1
@@ -3251,6 +3255,7 @@ test_audit_storage_verdict_distinguishes_floor_from_percentage() {
       /boot/firmware) printf '510M 419M 91M 82%% vfat 93184\n' ;;
     esac
   }
+  collect_storage_mounts
   out="$(mount_pressure_summary)"
   assert_contains "$out" "WARN: /boot/firmware has 91M free (82% used)" || rc=1
   assert_contains "$out" "kernel package needs about 25M" || rc=1
@@ -3264,6 +3269,7 @@ test_audit_storage_verdict_distinguishes_floor_from_percentage() {
       /boot/firmware) printf '20G 18.2G 900M 91%% ext4 921600\n' ;;
     esac
   }
+  collect_storage_mounts
   out="$(mount_pressure_summary)"
   assert_contains "$out" "WARN: /boot/firmware has 900M free (91% used)" || rc=1
   if assert_contains "$out" "kernel package needs about 25M"; then rc=1; fi
@@ -3284,11 +3290,13 @@ test_audit_storage_verdict_not_healthy_when_mount_unmeasured() {
     esac
   }
 
+  collect_storage_mounts
   out="$(mount_pressure_summary)"
   assert_contains "$out" "Disk pressure unknown: could not measure /boot/firmware" || rc=1
   if assert_contains "$out" "No disk pressure"; then rc=1; fi
 
   mount_stats() { return 1; }
+  collect_storage_mounts
   out="$(mount_pressure_summary)"
   assert_contains "$out" "Disk pressure unknown: could not measure / /boot/firmware" || rc=1
   if assert_contains "$out" "No disk pressure"; then rc=1; fi

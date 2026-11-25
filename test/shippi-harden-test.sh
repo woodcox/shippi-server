@@ -3255,6 +3255,8 @@ test_audit_storage_verdict_distinguishes_floor_from_percentage() {
   out="$(mount_pressure_summary)"
   assert_contains "$out" "WARN: /boot/firmware has 91M free (82% used)" || rc=1
   assert_contains "$out" "kernel package needs about 25M" || rc=1
+  assert_contains "$out" "apt may fail the kernel" || rc=1
+  if assert_contains "$out" "apt will fail"; then rc=1; fi
 
   # 91% used but 900M free: percentage rule only, so no apt-failure claim.
   mount_stats() {

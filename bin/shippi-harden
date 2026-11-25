@@ -4201,7 +4201,7 @@ mount_pressure_summary() {
       printf '  WARN: %s\n' "$w"
     done
     if ((boot_low_free)); then
-      printf '  A kernel package needs about 25M, so apt will fail the kernel\n'
+      printf '  A kernel package needs about 25M, so apt may fail the kernel\n'
       printf '  step, keep the old kernel, and silently stop receiving fixes.\n'
     fi
   elif ((${#failed[@]} == 0)); then

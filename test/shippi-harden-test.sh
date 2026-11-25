@@ -3162,12 +3162,12 @@ test_storage_mounts_keeps_unmeasurable_mounts() {
 
 test_is_mountpoint_reports_unknown_on_df_failure() {
   setup_destdir
-  local rc=0 d status=0
+  local rc=0 d
   d="$(mktemp -d)"
   stub df
   df() { return 1; }
-  is_mountpoint "$d" || status=$?
-  assert_eq "$status" "2" || rc=1
+  is_mountpoint "$d"
+  assert_eq "$?" "2" || rc=1
   rm -rf "$d"
   teardown_destdir
   return $rc

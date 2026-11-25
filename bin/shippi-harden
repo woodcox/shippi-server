@@ -4110,6 +4110,7 @@ audit_mount_table() {
 # invisible. `images` counts vmlinuz files; the size includes initrds too.
 boot_kernel_summary() {
   local boot="${SHIPPI_BOOT_DIR:-/boot}"
+  local -a images=()
   local -a kernels=()
   local -A versions=()
   local f files size rel base flavor where="" rc
@@ -4119,21 +4120,22 @@ boot_kernel_summary() {
     return 0
   fi
 
+  # One pass over /boot: images holds every kernel/initrd file and kernels the
+  # vmlinuz subset, so the count, size, and version tally all derive from the
+  # same scan instead of three separate finds.
   while IFS= read -r f; do
-    kernels+=("$f")
-  done < <(find "$boot" -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null | sort)
+    images+=("$f")
+    [[ $f == vmlinuz-* ]] && kernels+=("$f")
+  done < <(find "$boot" -maxdepth 1 -type f \
+    \( -name 'vmlinuz-*' -o -name 'initrd.img-*' \) -printf '%f\n' 2>/dev/null | sort)
 
-  files="$(find "$boot" -maxdepth 1 -type f \
-    \( -name 'vmlinuz-*' -o -name 'initrd.img-*' \) -printf 'x\n' 2>/dev/null |
-    wc -l || true)"
+  files="${#images[@]}"
   if ((files == 0)); then
     printf 'none in %s\n' "$boot"
     return 0
   fi
 
-  size="$(find "$boot" -maxdepth 1 -type f \
-    \( -name 'vmlinuz-*' -o -name 'initrd.img-*' \) -exec du -ch {} + 2>/dev/null |
-    tail -1 | cut -f1 || true)"
+  size="$(du -ch -- "${images[@]/#/$boot/}" 2>/dev/null | tail -1 | cut -f1 || true)"
   for f in "${kernels[@]}"; do
     rel="${f#vmlinuz-}"
     flavor="$(kernel_flavor "$rel")"

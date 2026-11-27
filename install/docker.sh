@@ -82,6 +82,50 @@ configure_docker_access() {
   fi
 }
 
+configure_memory_cgroup() {
+  section "Docker memory cgroup..."
+
+  # Docker's memory usage metrics need the kernel memory cgroup, which
+  # Raspberry Pi OS leaves disabled by default. It is switched on through
+  # kernel cmdline flags in the Pi's boot file and takes effect on reboot.
+  local cmdline="/boot/firmware/cmdline.txt"
+
+  if [ ! -f "$cmdline" ]; then
+    echo "✓ No $cmdline found, skipping memory cgroup"
+    return
+  fi
+
+  # A literal `--` token separates kernel parameters (before it) from init
+  # arguments (after it). cgroup flags are kernel parameters, so they are
+  # inserted before the separator, and only the kernel-parameter half is
+  # searched so a flag sitting in the init half is not mistaken for enabled.
+  local line kernel_args init_args=""
+  line="$(cat "$cmdline")"
+  if [[ "$line" == *" -- "* ]]; then
+    kernel_args="${line%% -- *}"
+    init_args=" -- ${line#* -- }"
+  elif [[ "$line" == *" --" ]]; then
+    kernel_args="${line% --}"
+    init_args=" --"
+  else
+    kernel_args="$line"
+  fi
+
+  if [[ "$kernel_args" == *"cgroup_enable=memory"* ]] \
+     && [[ "$kernel_args" == *"cgroup_memory=1"* ]]; then
+    echo "✓ Memory cgroup already enabled"
+    return
+  fi
+
+  # cmdline.txt must stay a single line. Command substitution strips the
+  # trailing newline, and printf reassembles the kernel args, the new flags,
+  # then any init arguments as one line, so no stray newline is introduced.
+  printf '%s cgroup_enable=memory cgroup_memory=1%s' "$kernel_args" "$init_args" \
+    | sudo tee "$cmdline" > /dev/null
+
+  echo "✓ Enabled cgroup_enable=memory cgroup_memory=1 (reboot to apply)"
+}
+
 enable_docker_service() {
   sudo systemctl enable docker
   sudo systemctl start docker

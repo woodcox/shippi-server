@@ -95,17 +95,32 @@ configure_memory_cgroup() {
     return
   fi
 
-  if grep -qs 'cgroup_enable=memory' "$cmdline" && grep -qs 'cgroup_memory=1' "$cmdline"; then
+  # A literal `--` token separates kernel parameters (before it) from init
+  # arguments (after it). cgroup flags are kernel parameters, so they are
+  # inserted before the separator, and only the kernel-parameter half is
+  # searched so a flag sitting in the init half is not mistaken for enabled.
+  local line kernel_args init_args=""
+  line="$(cat "$cmdline")"
+  if [[ "$line" == *" -- "* ]]; then
+    kernel_args="${line%% -- *}"
+    init_args=" -- ${line#* -- }"
+  elif [[ "$line" == *" --" ]]; then
+    kernel_args="${line% --}"
+    init_args=" --"
+  else
+    kernel_args="$line"
+  fi
+
+  if [[ "$kernel_args" == *"cgroup_enable=memory"* ]] \
+     && [[ "$kernel_args" == *"cgroup_memory=1"* ]]; then
     echo "✓ Memory cgroup already enabled"
     return
   fi
 
   # cmdline.txt must stay a single line. Command substitution strips the
-  # trailing newline, and printf writes it back as one line with the flags
-  # appended, so no stray newline confuses the boot firmware.
-  local line
-  line="$(cat "$cmdline")"
-  printf '%s cgroup_enable=memory cgroup_memory=1' "$line" \
+  # trailing newline, and printf reassembles the kernel args, the new flags,
+  # then any init arguments as one line, so no stray newline is introduced.
+  printf '%s cgroup_enable=memory cgroup_memory=1%s' "$kernel_args" "$init_args" \
     | sudo tee "$cmdline" > /dev/null
 
   echo "✓ Enabled cgroup_enable=memory cgroup_memory=1 (reboot to apply)"

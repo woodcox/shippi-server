@@ -178,7 +178,7 @@ finish() {
   echo "Cleaning up unused packages..."
   sudo apt autoremove --purge -y
 
-  echo "Now logout and back in for everything to take effect"
+  echo "Now reboot for everything to take effect"
 }
 
 configure_parallel_builds() {
@@ -243,6 +243,9 @@ run_installation() {
   # Setup Docker group with optional root level access
   install_docker
   configure_docker_access
+
+  # Expose Docker memory metrics on Raspberry Pi (edits /boot/firmware/cmdline.txt)
+  configure_memory_cgroup
 
   # OS-specific service enabling
   enable_services

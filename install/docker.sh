@@ -82,6 +82,35 @@ configure_docker_access() {
   fi
 }
 
+configure_memory_cgroup() {
+  section "Docker memory cgroup..."
+
+  # Docker's memory usage metrics need the kernel memory cgroup, which
+  # Raspberry Pi OS leaves disabled by default. It is switched on through
+  # kernel cmdline flags in the Pi's boot file and takes effect on reboot.
+  local cmdline="/boot/firmware/cmdline.txt"
+
+  if [ ! -f "$cmdline" ]; then
+    echo "✓ No $cmdline found, skipping memory cgroup"
+    return
+  fi
+
+  if grep -qs 'cgroup_enable=memory' "$cmdline" && grep -qs 'cgroup_memory=1' "$cmdline"; then
+    echo "✓ Memory cgroup already enabled"
+    return
+  fi
+
+  # cmdline.txt must stay a single line. Command substitution strips the
+  # trailing newline, and printf writes it back as one line with the flags
+  # appended, so no stray newline confuses the boot firmware.
+  local line
+  line="$(cat "$cmdline")"
+  printf '%s cgroup_enable=memory cgroup_memory=1' "$line" \
+    | sudo tee "$cmdline" > /dev/null
+
+  echo "✓ Enabled cgroup_enable=memory cgroup_memory=1 (reboot to apply)"
+}
+
 enable_docker_service() {
   sudo systemctl enable docker
   sudo systemctl start docker

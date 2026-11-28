@@ -252,8 +252,9 @@ page_hardening() {
   section "Campfire reports"
   cmd "sudo shippi-report test"            "send a test message"
   cmd "sudo shippi-report updates --force" "send the latest update result now"
-  cmd "sudo shippi-report configure"  "store the Shippi bot key (mode 0600)"
-  cmd "shippi-report --help"          "setup, config and command reference"
+  cmd "shippi-report --help"               "command and config reference"
+  echo -e "  ${DIM}  The Shippi bot and /etc/shippi/campfire-notify.conf come from${RESET}"
+  echo -e "  ${DIM}  campfire-agents/scripts/install-shippi-notifier.sh.${RESET}"
   echo -e "  ${DIM}  Update reports are automatic once configured: installed packages,${RESET}"
   echo -e "  ${DIM}  held-back packages and failed units post; a clean run stays silent.${RESET}"
 

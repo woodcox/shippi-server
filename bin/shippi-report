@@ -66,13 +66,6 @@ Commands:
     [--unit UNIT]      apt-daily.service hook)
     [--force]
   test                 send a test message and exit non-zero on failure
-  configure            write the bot config interactively
-    [--room ID]        Campfire room id (default: prompt, then 2)
-    [--key KEY|-]      Shippi bot key ("<user id>-<token>"; "-" reads stdin)
-    [--url URL]        Campfire base URL (default: auto-discover the
-                       once-campfire container on the Docker network)
-    [--container NAME] container name hint for auto-discovery
-                       (default: once-campfire)
 
 Options:
   --config PATH        config file (default: /etc/shippi/campfire-notify.conf)
@@ -86,10 +79,10 @@ Configuration:
     SHIPPI_CAMPFIRE_ROOM=2
     SHIPPI_CAMPFIRE_BOT_KEY=3-...
 
-  The Shippi bot is created by campfire-agents/scripts/setup_campfire.rb.
-  Its key is printed by that script (and by the notifier installer). The
-  same SHIPPI_CAMPFIRE_* names can be supplied as environment variables,
-  which override the file.
+  The Shippi bot and this config are created by
+  campfire-agents/scripts/install-shippi-notifier.sh (which runs
+  setup_campfire.rb and writes this file). The same SHIPPI_CAMPFIRE_* names
+  can be supplied as environment variables, which override the file.
 
 Automatic update reports:
   `shippi-harden updates` installs this command at /usr/local/sbin and adds
@@ -99,7 +92,6 @@ Automatic update reports:
   warnings emitted during a hardening run.
 
 Examples:
-  sudo shippi-report configure
   sudo shippi-report test
   sudo shippi-report updates --force
   shippi-report send "backup finished on the Pi"
@@ -111,9 +103,6 @@ EOF
 # Config and transport
 # ---------------------------------------------------------------------------
 _hostname() { hostname 2>/dev/null || uname -n; }
-
-# Trim a value without letting an empty assignment trip set -u.
-_trim() { printf '%s' "${1//[[:space:]]/}"; }
 
 _valid_room() { [[ ${SHIPPI_CAMPFIRE_ROOM:-} =~ ^[0-9]+$ ]]; }
 
@@ -139,6 +128,15 @@ _config_load() {
   SHIPPI_CAMPFIRE_CONTAINER="${SHIPPI_CAMPFIRE_CONTAINER:-once-campfire}"
 
   if [[ -f $CONFIG ]]; then
+    # The file is sourced, so its contents execute. Refuse a config writable
+    # by group or other: the systemd hooks source it as root, and a writable
+    # file would let any local user run code as root on the next update.
+    local mode
+    mode="$(stat -c %a "$CONFIG" 2>/dev/null || true)"
+    if [[ -n $mode ]] && [[ ${mode:1:1}${mode:2:1} =~ [2367] ]]; then
+      error "refusing to use ${CONFIG}: group- or world-writable (mode ${mode}); run: chmod 600 ${CONFIG}"
+      return 1
+    fi
     # shellcheck disable=SC1090
     if ! . "$CONFIG"; then
       error "could not read ${CONFIG}"
@@ -159,6 +157,13 @@ _config_load() {
     error "no valid Campfire bot key (set SHIPPI_CAMPFIRE_BOT_KEY in ${CONFIG})"
     return 1
   }
+  case "${SHIPPI_CAMPFIRE_URL}" in
+    auto | http://* | https://*) ;;
+    *)
+      error "SHIPPI_CAMPFIRE_URL must be an http(s) URL or 'auto', got '${SHIPPI_CAMPFIRE_URL}'"
+      return 1
+      ;;
+  esac
 }
 
 _redact() {
@@ -400,10 +405,11 @@ _report_unit_failure() {
   local invocation="$5" force="$6" key body detail errors=""
   key="unit:${unit}:${invocation:-${result}:${exit_status}}"
 
-  # A unit failure and an upgrade run are different reports. Sharing
-  # updates.state meant a daily apt-daily failure overwrote the run key and
-  # the unchanged upgrade log was posted again.
-  if ((!force)) && _already_sent unit-failures "$key"; then
+  # A unit failure and an upgrade run are different reports, and two different
+  # units are different reports too. Sharing one state file meant an apt-daily
+  # failure overwrote the apt-daily-upgrade key and the same issue was posted
+  # again. Scope the dedupe state to the unit.
+  if ((!force)) && _already_sent "unit-${unit}" "$key"; then
     note "${unit} failure already reported"
     return 0
   fi
@@ -424,12 +430,25 @@ _report_unit_failure() {
   if [[ $unit == apt-daily.service ]]; then
     body+=$'\n'"Package lists may be stale; unattended upgrades could miss security updates."
   elif [[ $unit == apt-daily-upgrade.service ]]; then
+    # A failed run still has an Installed/Auto-removed/Kept-back list worth
+    # naming: "failed" alone hides whether anything was installed first. The
+    # one post carries the same fields a clean run would.
     local parsed
     if parsed="$(_parse_last_upgrade 2>/dev/null || true)" && [[ -n $parsed ]]; then
       local -a fields=()
       mapfile -d $'\034' -t fields <<<"$parsed"
+      local pkg="${fields[2]:-}" removed="${fields[3]:-}" kept="${fields[4]:-}"
       errors="${fields[5]:-}"
       errors="${errors%$'\n'}"
+      if [[ -n $pkg ]]; then
+        body+=$'\n'"Installed: ${pkg}"
+      fi
+      if [[ -n $removed ]]; then
+        body+=$'\n'"Auto-removed: ${removed}"
+      fi
+      if [[ -n $kept ]]; then
+        body+=$'\n'"Kept back (will not be installed unattended): ${kept}"
+      fi
       if [[ -n $errors ]]; then
         body+=$'\n'"Last errors:"$'\n'"$errors"
       fi
@@ -437,7 +456,7 @@ _report_unit_failure() {
   fi
 
   printf '%s\n' "$body" | _campfire_post || return 1
-  _mark_sent unit-failures "$key" || true
+  _mark_sent "unit-${unit}" "$key" || true
 }
 
 _updates_result() {
@@ -618,106 +637,6 @@ cmd_test() {
     _campfire_post
 }
 
-cmd_configure() {
-  local room="" key="" url="auto" container="once-campfire"
-  while (($#)); do
-    case "$1" in
-      --room)
-        (($# >= 2)) || { error "--room needs an id"; return 2; }
-        room="$2"
-        shift
-        ;;
-      --key)
-        (($# >= 2)) || { error "--key needs a value"; return 2; }
-        key="$2"
-        shift
-        ;;
-      --url)
-        (($# >= 2)) || { error "--url needs a value"; return 2; }
-        url="$2"
-        shift
-        ;;
-      --container)
-        (($# >= 2)) || { error "--container needs a name"; return 2; }
-        container="$2"
-        shift
-        ;;
-      *) error "unknown configure option: $1"; return 2 ;;
-    esac
-    shift
-  done
-
-  if [[ -z $room ]]; then
-    if [[ -t 0 ]]; then
-      read -r -p "  Campfire room id [2]: " room
-    fi
-    room="${room:-2}"
-  fi
-  if [[ $key == - ]]; then
-    IFS= read -r key || true
-  fi
-  if [[ -z $key ]]; then
-    if [[ -t 0 ]]; then
-      read -r -s -p "  Shippi bot key (<id>-<token>): " key
-      printf '\n'
-    fi
-  fi
-  key="$(_trim "${key:-}")"
-  room="$(_trim "${room:-}")"
-
-  SHIPPI_CAMPFIRE_ROOM="$room"
-  SHIPPI_CAMPFIRE_BOT_KEY="$key"
-  _valid_room || { error "room id must be numeric, got '${room}'"; return 2; }
-  _valid_key || { error "bot key must look like '<user id>-<token>'"; return 2; }
-
-  SHIPPI_CAMPFIRE_URL="$url"
-  SHIPPI_CAMPFIRE_CONTAINER="$container"
-  _campfire_base_url >/dev/null || return 1
-
-  if ((DRY_RUN)); then
-    printf 'would write %s (mode 0600)\n' "$CONFIG"
-    printf '  room: %s\n  bot key: <redacted>\n  url: %s\n' "$room" "$url"
-    printf 'shippi-report test from %s: Campfire reporting works.\n' "$(_hostname)" |
-      _campfire_post
-    return 0
-  fi
-
-  if [[ $CONFIG == /etc/* && $(id -u) -ne 0 ]]; then
-    error "writing ${CONFIG} needs root; run this with sudo"
-    return 1
-  fi
-  if ! install -d -m 0755 "$(dirname "$CONFIG")" 2>/dev/null; then
-    error "could not create $(dirname "$CONFIG")"
-    return 1
-  fi
-
-  local tmp="${CONFIG}.tmp.$$"
-  if ! (
-    umask 077
-    {
-      printf '# Managed by shippi-report. Contains the Shippi bot key.\n'
-      printf '# Keep this file root-owned and mode 0600.\n'
-      printf 'SHIPPI_CAMPFIRE_URL=%q\n' "$url"
-      printf 'SHIPPI_CAMPFIRE_ROOM=%q\n' "$room"
-      printf 'SHIPPI_CAMPFIRE_BOT_KEY=%q\n' "$key"
-      printf 'SHIPPI_CAMPFIRE_CONTAINER=%q\n' "$container"
-    } >"$tmp"
-  ); then
-    rm -f "$tmp"
-    error "could not write ${CONFIG}"
-    return 1
-  fi
-  if ! mv -f "$tmp" "$CONFIG"; then
-    rm -f "$tmp"
-    error "could not install ${CONFIG}"
-    return 1
-  fi
-  chmod 0600 "$CONFIG"
-  printf 'wrote %s (mode 0600)\n' "$CONFIG"
-
-  cmd_test
-}
-
 main() {
   local command="" args=()
   local -a original=("$@")
@@ -792,7 +711,6 @@ main() {
     updates) cmd_updates "${args[@]+"${args[@]}"}" ;;
     unit-failure) cmd_unit_failure "${args[@]+"${args[@]}"}" ;;
     test) cmd_test ;;
-    configure) cmd_configure "${args[@]+"${args[@]}"}" ;;
     *)
       error "unknown command: ${command}"
       usage >&2

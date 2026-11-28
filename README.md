@@ -284,9 +284,9 @@ Some deliberate choices worth knowing before you run it:
   `/usr/local/sbin/shippi-report` and adds `ExecStopPost` hooks to
   `apt-daily.service` and `apt-daily-upgrade.service`, so this works without
   the user's home directory being mounted or on root's `PATH`. The bot key
-  lives in `/etc/shippi/campfire-notify.conf` (mode `0600`); create the
-  `Shippi` bot with `campfire-agents/scripts/setup_campfire.rb` and store its
-  key with `sudo shippi-report configure`.
+  lives in `/etc/shippi/campfire-notify.conf` (mode `0600`); the `Shippi` bot
+  and that config are created by
+  `campfire-agents/scripts/install-shippi-notifier.sh`.
 - **`net.ipv4.ip_forward` is left alone** when the Docker service is *running*,
   since the container bridge needs it. If Docker is installed but stopped when
   you run the script, forwarding is turned off; start Docker and re-run if that

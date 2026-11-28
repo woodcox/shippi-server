@@ -59,7 +59,7 @@ WARNINGS=()
 # Test-only override so the config writers can be exercised against a
 # throwaway tree instead of the live system. Unset in normal use.
 CONF_DEST="${SHIPPI_SECURITY_DESTDIR:-}"
-# Where this script lives, captured once. report_bin and configure_updates
+# Where this script lives, captured once. _report_bin and configure_updates
 # need the sibling shippi-report, and BASH_SOURCE[0] is not trustworthy inside
 # a function that the test suite has restored with eval: it then points at the
 # test file.
@@ -3736,11 +3736,7 @@ EOF
   # exits quietly until the key is configured, then reports start with no
   # second shippi-harden run.
   local report_src=""
-  if [[ -n ${SCRIPT_DIR:-} && -x ${SCRIPT_DIR}/shippi-report ]]; then
-    report_src="${SCRIPT_DIR}/shippi-report"
-  else
-    report_src="$(command -v shippi-report 2>/dev/null || true)"
-  fi
+  report_src="$(_report_bin || true)"
 
   if [[ -n $report_src ]] && ! have curl; then
     warn "curl is not installed; Campfire update reports will fail until it is"
@@ -3767,22 +3763,14 @@ EOF
     # leading - keeps a Campfire outage from marking the update unit failed.
     # shippi-report reads SERVICE_RESULT/EXIT_* from systemd and decides
     # whether there is anything worth saying.
-    # Built with printf, not heredocs inside this `if`: `declare -f` cannot
-    # round-trip a heredoc that sits inside a compound command, and the test
-    # suite stubs this function and restores it with eval. A heredoc here
-    # silently turned the restored configure_updates into a no-op.
-    printf '%s\n' \
-      '[Service]' \
-      '# Report installed packages, held-back packages and failures to Campfire.' \
-      '# A clean run is silent. Installed by shippi-harden updates.' \
-      'ExecStopPost=-/usr/local/sbin/shippi-report updates' |
-      write_conf /etc/systemd/system/apt-daily-upgrade.service.d/shippi-campfire.conf
-    printf '%s\n' \
-      '[Service]' \
-      '# A failed package-list refresh means unattended-upgrades can miss security' \
-      '# updates. Report that failure; stay silent on success.' \
-      'ExecStopPost=-/usr/local/sbin/shippi-report unit-failure --unit apt-daily.service' |
-      write_conf /etc/systemd/system/apt-daily.service.d/shippi-campfire.conf
+    _install_report_hook \
+      /etc/systemd/system/apt-daily-upgrade.service.d/shippi-campfire.conf \
+      updates \
+      'Report installed packages, held-back packages and failures to Campfire. A clean run is silent.'
+    _install_report_hook \
+      /etc/systemd/system/apt-daily.service.d/shippi-campfire.conf \
+      'unit-failure --unit apt-daily.service' \
+      'A failed package-list refresh means unattended-upgrades can miss security updates. Report that failure; stay silent on success.'
     if ((DRY_RUN)); then
       note "would run: systemctl daemon-reload"
     elif run_root systemctl daemon-reload 2>/dev/null; then
@@ -3796,8 +3784,7 @@ EOF
     [[ -n ${SHIPPI_CAMPFIRE_BOT_KEY:-} ]]; then
     ok "Campfire update reports are configured"
   else
-    note "to message a Campfire room, run: sudo shippi-report configure"
-    note "the Shippi bot is created by campfire-agents/scripts/setup_campfire.rb"
+    note "create the Shippi bot and config with campfire-agents/scripts/install-shippi-notifier.sh"
   fi
 
   if ((DRY_RUN)); then
@@ -4618,7 +4605,7 @@ EOF
 # the same directory, and a stale copy on PATH would be worse than none. The
 # environment override exists so the tests can point at a recorder without
 # posting anything.
-report_bin() {
+_report_bin() {
   if [[ -n ${SHIPPI_REPORT_BIN:-} ]]; then
     if [[ -x $SHIPPI_REPORT_BIN ]] || command -v "$SHIPPI_REPORT_BIN" >/dev/null 2>&1; then
       printf '%s\n' "$SHIPPI_REPORT_BIN"
@@ -4633,18 +4620,33 @@ report_bin() {
   command -v shippi-report 2>/dev/null
 }
 
+# Write one ExecStopPost drop-in that reports to Campfire. The two hooks differ
+# only in path, the reporter command, and the comment that documents them. A
+# failed write warns and continues: a missing hook means silent reporting, not
+# a broken hardening run.
+_install_report_hook() {
+  local path="$1" command="$2" why="$3"
+  if ! printf '%s\n' \
+    '[Service]' \
+    "# ${why}" \
+    "ExecStopPost=-/usr/local/sbin/shippi-report ${command}" |
+    write_conf "$path"; then
+    warn "could not install the Campfire hook ${path}"
+  fi
+}
+
 # A hardening run that emitted warnings is an issue, and on a headless box the
 # warnings only ever existed on the terminal. Send one summary, deduplicated,
 # and never let a notification failure change the run's exit status. Must not
 # call warn() here: that would append to the list being read.
-notify_warnings() {
+_notify_warnings() {
   if ((${#WARNINGS[@]} == 0)); then
     note "no warnings to report"
     return 0
   fi
 
   local reporter
-  reporter="$(report_bin || true)"
+  reporter="$(_report_bin || true)"
   if [[ -z $reporter ]]; then
     printf '  %s!%s shippi-report was not found; warnings were not sent\n' \
       "$C_RED" "$C_OFF" >&2
@@ -4674,19 +4676,32 @@ notify_warnings() {
 
   local conf="${SHIPPI_CAMPFIRE_CONFIG:-/etc/shippi/campfire-notify.conf}"
   local sent=0
-  if [[ -n ${SHIPPI_REPORT_BIN:-} || -n ${SHIPPI_CAMPFIRE_BOT_KEY:-} ||
-    ! -e $conf || -r $conf ]]; then
-    # A test override, an env-supplied key, or a config this user can already
-    # read needs no elevation. Running the reporter through run_root when it
-    # is not needed would add a sudo prompt to a warning summary.
+  if [[ -n ${SHIPPI_REPORT_BIN:-} || -n ${SHIPPI_CAMPFIRE_BOT_KEY:-} ]]; then
+    # A test override or an env-supplied key needs no elevation.
     if printf '%s\n' "$body" | "$reporter" send; then
       sent=1
     fi
-  elif printf '%s\n' "$body" | run_root "$reporter" send; then
+  elif [[ ! -e $conf ]]; then
+    # Not configured yet: say so instead of reporting a failed send.
+    note "Campfire reporting is not configured (${conf} is missing); warnings were not sent"
+    return 0
+  elif [[ -r $conf ]]; then
+    # A config this user can already read needs no elevation.
+    if printf '%s\n' "$body" | "$reporter" send; then
+      sent=1
+    fi
+  else
     # The default config is root-owned 0600. A normal user running
-    # `shippi-harden --notify` cannot read it, and the sudo ticket warmed at
-    # the start of the run is the intended way in.
-    sent=1
+    # `shippi-harden --notify` cannot read it, so elevate through the same
+    # sudo path the rest of the run uses. Prefer the installed reporter the
+    # daily hooks run, so a checkout/~/.local/bin copy cannot drift from it.
+    local root_reporter="$reporter"
+    if [[ -x /usr/local/sbin/shippi-report ]]; then
+      root_reporter="/usr/local/sbin/shippi-report"
+    fi
+    if printf '%s\n' "$body" | run_root "$root_reporter" send; then
+      sent=1
+    fi
   fi
 
   if ((sent)); then
@@ -4831,7 +4846,7 @@ main() {
   # a plan must not have side effects, and this is the side effect a user is
   # most likely to notice.
   if ((WANT_NOTIFY)) && ((!DRY_RUN)); then
-    notify_warnings || true
+    _notify_warnings || true
   fi
 }
 

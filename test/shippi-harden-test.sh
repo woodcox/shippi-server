@@ -597,7 +597,7 @@ EOF
   SHIPPI_REPORT_BIN="$TEST_TMP/notifier"
   SHIPPI_NOTIFY_LOG="$log"
   export SHIPPI_NOTIFY_LOG
-  notify_warnings >/dev/null 2>&1 || rc=1
+  _notify_warnings >/dev/null 2>&1 || rc=1
   [[ -f $log ]] || {
     printf '        the notifier was not called\n'
     rc=1
@@ -620,7 +620,7 @@ test_notify_warnings_is_silent_when_clean() {
   local rc=0 out
   WARNINGS=()
   SHIPPI_REPORT_BIN="$TEST_TMP/does-not-exist"
-  out="$(notify_warnings 2>&1)" || rc=1
+  out="$(_notify_warnings 2>&1)" || rc=1
   [[ $out == *"no warnings to report"* ]] || {
     printf '        a clean run did not say it had nothing to report: %s\n' "$out"
     rc=1
@@ -641,8 +641,8 @@ test_notify_warnings_elevates_for_a_root_only_config() {
   chmod 000 "$conf"
   SHIPPI_CAMPFIRE_CONFIG="$conf"
   SHIPPI_REPORT_BIN=""
-  stub report_bin
-  report_bin() { printf '%s\n' "$TEST_TMP/notifier"; }
+  stub _report_bin
+  _report_bin() { printf '%s\n' "$TEST_TMP/notifier"; }
   stub run_root
   run_root() {
     printf 'run_root %s\n' "$*" >>"$log"
@@ -650,7 +650,7 @@ test_notify_warnings_elevates_for_a_root_only_config() {
     return 0
   }
   WARNINGS=("a warning that needs root")
-  notify_warnings >/dev/null 2>&1 || rc=1
+  _notify_warnings >/dev/null 2>&1 || rc=1
   grep -q 'a warning that needs root' "$log" 2>/dev/null || {
     printf '        the summary was not sent through run_root\n'
     rc=1
@@ -668,10 +668,29 @@ test_notify_warnings_does_not_post_without_a_reporter() {
   local rc=0 out
   WARNINGS=("a warning")
   SHIPPI_REPORT_BIN="$TEST_TMP/no-such-reporter"
-  out="$(notify_warnings 2>&1)" && rc=1
+  out="$(_notify_warnings 2>&1)" && rc=1
   [[ $out == *"shippi-report was not found"* ]] || rc=1
   WARNINGS=()
   SHIPPI_REPORT_BIN=""
+  return $rc
+}
+
+test_notify_warnings_says_not_configured_when_config_missing() {
+  # A box that never configured Campfire must say so, not claim the send
+  # failed. The config path is missing here.
+  local rc=0 out
+  WARNINGS=("a warning")
+  SHIPPI_REPORT_BIN=""
+  SHIPPI_CAMPFIRE_BOT_KEY=""
+  SHIPPI_CAMPFIRE_CONFIG="$TEST_TMP/no-such-campfire.conf"
+  rm -f "$SHIPPI_CAMPFIRE_CONFIG"
+  out="$(_notify_warnings 2>&1)" || rc=1
+  [[ $out == *"not configured"* ]] || {
+    printf '        a missing config did not say "not configured": %s\n' "$out"
+    rc=1
+  }
+  WARNINGS=()
+  SHIPPI_CAMPFIRE_CONFIG=""
   return $rc
 }
 
@@ -5602,6 +5621,7 @@ t 'warning summaries are deduplicated'                  test_notify_warnings_sen
 t 'a clean run has nothing to notify'                   test_notify_warnings_is_silent_when_clean
 t 'a root-only config uses the sudo path'               test_notify_warnings_elevates_for_a_root_only_config
 t 'no reporter is a failure, not a sent message'        test_notify_warnings_does_not_post_without_a_reporter
+t 'a missing config says not configured'                 test_notify_warnings_says_not_configured_when_config_missing
 t 'rpi origin survives the spaces in "Raspberry Pi Foundation"' test_rpi_origin_combo_keeps_the_spaced_origin
 t 'a half-read release line yields no origin'          test_rpi_origin_combo_rejects_a_half_read_release_line
 t 'the rpi archive is auto-updated where present'       test_rpi_archive_is_allowed_when_this_box_has_it

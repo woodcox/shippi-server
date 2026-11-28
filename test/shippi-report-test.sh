@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# Tests for shippi-report. Sourced, never executed, so main() never runs.
+# Tests for shippi-report. This file is the executable runner; it sources
+# shippi-report, whose main() never runs because the script is sourced, not
+# executed.
 #
 # The interesting cases are the quiet ones: a clean update run must not post,
 # the same update run must not post twice, and a reporting failure must not
@@ -219,6 +221,21 @@ test_invalid_room_and_key_are_rejected() {
   return $rc
 }
 
+test_world_writable_config_is_refused() {
+  # The config is sourced, so a group-/world-writable file would run its
+  # contents as root on the next systemd hook. Refuse it before sourcing.
+  setup world-writable
+  chmod 666 "$CONFIG"
+  local rc=0 out
+  out="$(main send "hello" 2>&1)" && rc=1
+  assert_contains "$out" "world-writable" || rc=1
+  [[ ! -e $CASE_DIR/body ]] || {
+    printf '        a rejected config still reached curl\n'
+    rc=1
+  }
+  return $rc
+}
+
 test_dry_run_does_not_post_or_write_state() {
   setup dry-run
   local rc=0 out
@@ -375,6 +392,25 @@ EOF
   return $rc
 }
 
+test_failed_upgrade_names_what_was_installed() {
+  # A failed run still names what it installed before the error, not just the
+  # error lines.
+  setup failed-with-packages
+  cat >"$SHIPPI_UNATTENDED_LOG" <<'EOF'
+2026-11-28 06:00:00,000 INFO Starting unattended upgrades script
+2026-11-28 06:00:01,000 INFO Packages that will be upgraded: bash
+2026-11-28 06:00:02,000 ERROR could not acquire the apt lock
+EOF
+  SERVICE_RESULT="exit-code" EXIT_CODE="exited" EXIT_STATUS="100" INVOCATION_ID="inv-fail"
+  export SERVICE_RESULT EXIT_CODE EXIT_STATUS INVOCATION_ID
+  local rc=0 body
+  main updates >/dev/null 2>&1 || rc=1
+  body="$(cat "$CASE_DIR/body" 2>/dev/null)"
+  assert_contains "$body" "Installed: bash" || rc=1
+  assert_contains "$body" "could not acquire the apt lock" || rc=1
+  return $rc
+}
+
 test_systemd_failure_is_reported_even_without_a_log() {
   setup unit-failure
   rm -f "$SHIPPI_UNATTENDED_LOG"
@@ -513,6 +549,41 @@ EOF
   return $rc
 }
 
+test_unit_failures_do_not_clobber_each_other() {
+  # apt-daily and apt-daily-upgrade failures are different reports; one must
+  # not suppress the other's dedupe key.
+  setup unit-per-unit
+  SERVICE_RESULT="exit-code" EXIT_CODE="exited" EXIT_STATUS="100"
+  export SERVICE_RESULT EXIT_CODE EXIT_STATUS
+
+  INVOCATION_ID="inv-daily"
+  export INVOCATION_ID
+  main unit-failure --unit apt-daily.service >/dev/null 2>&1 || return 1
+  [[ -s $CASE_DIR/body ]] || {
+    printf '        the apt-daily failure did not post\n'
+    return 1
+  }
+  : >"$CASE_DIR/body"
+
+  INVOCATION_ID="inv-upgrade"
+  export INVOCATION_ID
+  main unit-failure --unit apt-daily-upgrade.service >/dev/null 2>&1 || return 1
+  [[ -s $CASE_DIR/body ]] || {
+    printf '        the upgrade-unit failure was suppressed by the apt-daily state\n'
+    return 1
+  }
+  : >"$CASE_DIR/body"
+
+  INVOCATION_ID="inv-daily"
+  export INVOCATION_ID
+  main unit-failure --unit apt-daily.service >/dev/null 2>&1 || return 1
+  [[ ! -s $CASE_DIR/body ]] || {
+    printf '        the same apt-daily failure was posted again\n'
+    return 1
+  }
+  return 0
+}
+
 test_executed_updates_serializes_through_a_lock() {
   # The in-process tests call main() directly. This is the one that proves the
   # real executable path re-execs under flock, so two overlapping hooks cannot
@@ -574,53 +645,6 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-printf '\nconfigure\n'
-
-test_configure_writes_a_0600_config_and_tests_it() {
-  setup configure
-  rm -f "$CONFIG"
-  local rc=0 body
-  main configure --room 2 --key 3-abcd --url http://127.0.0.1:9999 >/dev/null 2>&1 || rc=1
-  [[ -f $CONFIG ]] || {
-    printf '        no config was written\n'
-    rc=1
-  }
-  assert_eq "$(stat -c %a "$CONFIG" 2>/dev/null)" "600" || rc=1
-  grep -q '^SHIPPI_CAMPFIRE_BOT_KEY=3-abcd$' "$CONFIG" 2>/dev/null || rc=1
-  body="$(cat "$CASE_DIR/body" 2>/dev/null)"
-  assert_contains "$body" "Campfire reporting works" || rc=1
-  return $rc
-}
-
-test_configure_rejects_a_malformed_key() {
-  setup configure-bad
-  rm -f "$CONFIG"
-  main configure --room 2 --key nope --url http://127.0.0.1:9999 >/dev/null 2>&1 && return 1
-  [[ ! -e $CONFIG ]] || return 1
-  return 0
-}
-
-test_configure_dry_run_writes_nothing() {
-  # --dry-run must not create the root config just because the command also
-  # validates and tests it.
-  setup configure-dry
-  rm -f "$CONFIG"
-  local rc=0 out
-  out="$(main --dry-run configure --room 2 --key 3-abcd --url http://127.0.0.1:9999 2>&1)" || rc=1
-  assert_contains "$out" "would write" || rc=1
-  assert_contains "$out" "<redacted>" || rc=1
-  [[ ! -e $CONFIG ]] || {
-    printf '        a dry run wrote the bot config\n'
-    rc=1
-  }
-  [[ ! -e $CASE_DIR/body ]] || {
-    printf '        a dry run posted a test message\n'
-    rc=1
-  }
-  return $rc
-}
-
-# ---------------------------------------------------------------------------
 _t() {
   local name="$1" fn="$2"
   if ! declare -F "$fn" >/dev/null 2>&1; then
@@ -666,9 +690,9 @@ _t 'unit failure keeps upgrade state separate'   test_unit_failure_does_not_clob
 _t 'executed updates runs under a lock'          test_executed_updates_serializes_through_a_lock
 _t 'updates without config is a quiet no-op'     test_updates_without_config_is_a_quiet_noop
 _t 'a change without config explains itself'     test_updates_change_without_config_is_a_quiet_noop
-_t 'configure writes 0600 and tests it'          test_configure_writes_a_0600_config_and_tests_it
-_t 'configure rejects a malformed key'           test_configure_rejects_a_malformed_key
-_t 'configure dry run writes nothing'            test_configure_dry_run_writes_nothing
+_t 'a world-writable config is refused'          test_world_writable_config_is_refused
+_t 'a failed upgrade names what it installed'    test_failed_upgrade_names_what_was_installed
+_t 'unit failures do not clobber each other'     test_unit_failures_do_not_clobber_each_other
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1

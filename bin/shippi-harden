@@ -49,11 +49,21 @@ AGENT_FORWARDING=0
 # an ssh password opts in with --password-ssh.
 PASSWORD_SSH=0
 WANT_REPORT=0
+WANT_NOTIFY=0
 RUN_AUDIT=0
 NO_RESTART=0
+# Every warn() call is kept so --notify can send one summary at the end. A
+# hardening run is the only place that sees these; they used to scroll past
+# on a headless box and vanish.
+WARNINGS=()
 # Test-only override so the config writers can be exercised against a
 # throwaway tree instead of the live system. Unset in normal use.
 CONF_DEST="${SHIPPI_SECURITY_DESTDIR:-}"
+# Where this script lives, captured once. report_bin and configure_updates
+# need the sibling shippi-report, and BASH_SOURCE[0] is not trustworthy inside
+# a function that the test suite has restored with eval: it then points at the
+# test file.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
 SELECTED=()
 # --ssh-from values. Repeatable. Empty means "use the detected LAN prefixes".
 SSH_FROM=()
@@ -144,7 +154,12 @@ config_hint() {
 
 step() { printf '  %s\n' "$1"; }
 ok() { printf '  %s✓%s %s\n' "$C_RED" "$C_OFF" "$1"; }
-warn() { printf '  %s!%s %s\n' "$C_RED" "$C_OFF" "$1" >&2; }
+warn() {
+  printf '  %s!%s %s\n' "$C_RED" "$C_OFF" "$1" >&2
+  # Collected for --notify only. The array is not consulted by any task, so
+  # a run without --notify behaves exactly as before.
+  WARNINGS+=("$1")
+}
 note() { printf '  %s%s%s\n' "$C_DIM" "$1" "$C_OFF"; }
 skip() { printf '  %s-%s %s\n' "$C_DIM" "$C_OFF" "$1"; }
 
@@ -193,6 +208,8 @@ Options:
                         interface, plus tailscale0; by default SSH is never
                         opened to 0.0.0.0/0.
       --report       also save the audit report to ~/security-audit/
+      --notify       send a Campfire summary if this run emits warnings
+                     (needs shippi-report; see `shippi-report --help`)
       --audit        run the audit without the end-of-run prompt
       --no-restart   write configs but do not restart any service
   -l, --list        list tasks and exit
@@ -949,6 +966,9 @@ install_hardening_packages() {
     unattended-upgrades
     ca-certificates
     libpam-pwquality
+    # shippi-report posts with curl. It is not part of a minimal Debian
+    # install, and a reporter that cannot run is a silent update channel.
+    curl
   )
 
   if ((DRY_RUN)); then
@@ -3709,6 +3729,77 @@ EOF
     warn "no ${codename}-security suite in the apt sources; updates will not match anything"
   fi
 
+  # Outbound Campfire reports. The hooks run from systemd as root, outside
+  # this script, so install a stable copy of the reporter: the invoking user's
+  # ~/.local/bin is not on root's PATH and may not be mounted at boot. The
+  # hooks themselves are installed even before a bot key exists; shippi-report
+  # exits quietly until the key is configured, then reports start with no
+  # second shippi-harden run.
+  local report_src=""
+  if [[ -n ${SCRIPT_DIR:-} && -x ${SCRIPT_DIR}/shippi-report ]]; then
+    report_src="${SCRIPT_DIR}/shippi-report"
+  else
+    report_src="$(command -v shippi-report 2>/dev/null || true)"
+  fi
+
+  if [[ -n $report_src ]] && ! have curl; then
+    warn "curl is not installed; Campfire update reports will fail until it is"
+    note "the packages task installs it: sudo apt-get install curl"
+  fi
+
+  if [[ -n $report_src ]]; then
+    if ((DRY_RUN)); then
+      note "would install ${report_src} as /usr/local/sbin/shippi-report"
+    elif run_root install -d -m 0755 "${CONF_DEST}/usr/local/sbin" &&
+      run_root install -m 0755 "$report_src" "${CONF_DEST}/usr/local/sbin/shippi-report"; then
+      ok "Campfire reporter installed at /usr/local/sbin/shippi-report"
+    else
+      warn "could not install shippi-report; unattended updates cannot message Campfire"
+      report_src=""
+    fi
+  else
+    warn "shippi-report was not found next to shippi-harden or on PATH;"
+    warn "unattended updates cannot message Campfire"
+  fi
+
+  if [[ -n $report_src ]]; then
+    # ExecStopPost, not OnSuccess/OnFailure: it runs for both outcomes. The
+    # leading - keeps a Campfire outage from marking the update unit failed.
+    # shippi-report reads SERVICE_RESULT/EXIT_* from systemd and decides
+    # whether there is anything worth saying.
+    # Built with printf, not heredocs inside this `if`: `declare -f` cannot
+    # round-trip a heredoc that sits inside a compound command, and the test
+    # suite stubs this function and restores it with eval. A heredoc here
+    # silently turned the restored configure_updates into a no-op.
+    printf '%s\n' \
+      '[Service]' \
+      '# Report installed packages, held-back packages and failures to Campfire.' \
+      '# A clean run is silent. Installed by shippi-harden updates.' \
+      'ExecStopPost=-/usr/local/sbin/shippi-report updates' |
+      write_conf /etc/systemd/system/apt-daily-upgrade.service.d/shippi-campfire.conf
+    printf '%s\n' \
+      '[Service]' \
+      '# A failed package-list refresh means unattended-upgrades can miss security' \
+      '# updates. Report that failure; stay silent on success.' \
+      'ExecStopPost=-/usr/local/sbin/shippi-report unit-failure --unit apt-daily.service' |
+      write_conf /etc/systemd/system/apt-daily.service.d/shippi-campfire.conf
+    if ((DRY_RUN)); then
+      note "would run: systemctl daemon-reload"
+    elif run_root systemctl daemon-reload 2>/dev/null; then
+      ok "Campfire update-report hooks enabled"
+    else
+      warn "could not reload systemd; the Campfire update-report hooks may not be active"
+    fi
+  fi
+
+  if [[ -r ${CONF_DEST}/etc/shippi/campfire-notify.conf ]] ||
+    [[ -n ${SHIPPI_CAMPFIRE_BOT_KEY:-} ]]; then
+    ok "Campfire update reports are configured"
+  else
+    note "to message a Campfire room, run: sudo shippi-report configure"
+    note "the Shippi bot is created by campfire-agents/scripts/setup_campfire.rb"
+  fi
+
   if ((DRY_RUN)); then
     note "would verify with: apt-config dump | grep Unattended-Upgrade"
     return 0
@@ -4521,6 +4612,76 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Campfire reporting
+# ---------------------------------------------------------------------------
+# Prefer the shippi-report next to this script: a release installs both into
+# the same directory, and a stale copy on PATH would be worse than none. The
+# environment override exists so the tests can point at a recorder without
+# posting anything.
+report_bin() {
+  if [[ -n ${SHIPPI_REPORT_BIN:-} ]]; then
+    if [[ -x $SHIPPI_REPORT_BIN ]] || command -v "$SHIPPI_REPORT_BIN" >/dev/null 2>&1; then
+      printf '%s\n' "$SHIPPI_REPORT_BIN"
+      return 0
+    fi
+    return 1
+  fi
+  if [[ -n ${SCRIPT_DIR:-} && -x ${SCRIPT_DIR}/shippi-report ]]; then
+    printf '%s\n' "${SCRIPT_DIR}/shippi-report"
+    return 0
+  fi
+  command -v shippi-report 2>/dev/null
+}
+
+# A hardening run that emitted warnings is an issue, and on a headless box the
+# warnings only ever existed on the terminal. Send one summary, deduplicated,
+# and never let a notification failure change the run's exit status. Must not
+# call warn() here: that would append to the list being read.
+notify_warnings() {
+  if ((${#WARNINGS[@]} == 0)); then
+    note "no warnings to report"
+    return 0
+  fi
+
+  local reporter
+  reporter="$(report_bin || true)"
+  if [[ -z $reporter ]]; then
+    printf '  %s!%s shippi-report was not found; warnings were not sent\n' \
+      "$C_RED" "$C_OFF" >&2
+    return 1
+  fi
+
+  local -a unique=()
+  local -A seen=()
+  local w
+  for w in "${WARNINGS[@]}"; do
+    [[ -z $w || -n ${seen[$w]:-} ]] && continue
+    seen[$w]=1
+    unique+=("$w")
+  done
+
+  local body host count=0
+  host="$(hostname 2>/dev/null || uname -n)"
+  body="shippi-harden — ${host} — ${#unique[@]} warning(s)"
+  for w in "${unique[@]}"; do
+    if ((count >= 20)); then
+      body+=$'\n'"- and $((${#unique[@]} - count)) more"
+      break
+    fi
+    body+=$'\n'"- ${w}"
+    count=$((count + 1))
+  done
+
+  if printf '%s\n' "$body" | "$reporter" send; then
+    ok "warning summary sent to Campfire"
+    return 0
+  fi
+  printf '  %s!%s could not send the warning summary to Campfire\n' \
+    "$C_RED" "$C_OFF" >&2
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 want_task() {
@@ -4561,6 +4722,7 @@ main() {
         shift
         ;;
       --report) WANT_REPORT=1 ;;
+      --notify) WANT_NOTIFY=1 ;;
       --audit) RUN_AUDIT=1 ;;
       --no-restart) NO_RESTART=1 ;;
       -l | --list) list_tasks; return 0 ;;
@@ -4646,6 +4808,13 @@ main() {
     if ask "run the security audit now?" n; then
       audit
     fi
+  fi
+
+  # Last, so warnings from every task are in the list. Dry runs never send:
+  # a plan must not have side effects, and this is the side effect a user is
+  # most likely to notice.
+  if ((WANT_NOTIFY)) && ((!DRY_RUN)); then
+    notify_warnings || true
   fi
 }
 

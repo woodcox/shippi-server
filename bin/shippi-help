@@ -69,6 +69,7 @@ page_commands() {
   cmd "shippi-setup"   "Set git name, email and GitHub CLI auth"
   cmd "shippi-ssh"     "Add SSH key for remote access"
   cmd "shippi-harden"  "Run the security hardening tool (asks for sudo; try --dry-run first)"
+  cmd "shippi-report"  "Send hardening and update reports to a Campfire room"
 
   section "AI Tools"
   cmd "oc"  "opencode"
@@ -242,10 +243,19 @@ page_hardening() {
 
   section "Other options"
   cmd "--report"     "also save the audit report to ~/security-audit/"
+  cmd "--notify"     "send warnings to Campfire if shippi-report is configured"
   cmd "--audit"      "run the audit without the end-of-run prompt"
   cmd "--no-restart" "write configs but restart no service"
   cmd "-l, --list"   "list tasks and exit"
   echo -e "  ${DIM}  The audit is skipped by default and offered again at the end of the run.${RESET}"
+
+  section "Campfire reports"
+  cmd "shippi-report test"            "send a test message"
+  cmd "shippi-report updates --force" "send the latest update result now"
+  cmd "sudo shippi-report configure"  "store the Shippi bot key (mode 0600)"
+  cmd "shippi-report --help"          "setup, config and command reference"
+  echo -e "  ${DIM}  Update reports are automatic once configured: installed packages,${RESET}"
+  echo -e "  ${DIM}  held-back packages and failed units post; a clean run stays silent.${RESET}"
 
   section "LAN-only box with password login"
   cmd 'shippi-harden --password-ssh --dry-run' "then, if it looks right:"

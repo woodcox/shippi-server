@@ -178,6 +178,9 @@ teardown_destdir() {
   # choice into whatever runs next.
   AGENT_FORWARDING=0
   PASSWORD_SSH=0
+  WANT_NOTIFY=0
+  WARNINGS=()
+  SHIPPI_REPORT_BIN=""
   SSH_FROM=()
   SSH_LAN_APPLIED=()
 }
@@ -511,6 +514,131 @@ test_apt_config_origins_match_os_release() {
   grep -q "${codename}-security" "$CONF_DEST/etc/apt/apt.conf.d/51shippi-origins"
   local rc=$?
   teardown_destdir
+  return $rc
+}
+
+test_updates_installs_campfire_reporter_and_hooks() {
+  # The daily hook runs from systemd as root, where ~/.local/bin does not
+  # exist. Both the stable reporter copy and the unit drop-ins have to be
+  # written by the same task that configures unattended-upgrades, or the
+  # reporting is silently absent.
+  setup_destdir
+  configure_updates >/dev/null 2>&1
+  local rc=0
+  [[ -x $CONF_DEST/usr/local/sbin/shippi-report ]] || {
+    printf '        the reporter was not installed at /usr/local/sbin/shippi-report\n'
+    rc=1
+  }
+  local upgrade="$CONF_DEST/etc/systemd/system/apt-daily-upgrade.service.d/shippi-campfire.conf"
+  local daily="$CONF_DEST/etc/systemd/system/apt-daily.service.d/shippi-campfire.conf"
+  [[ -f $upgrade ]] || {
+    printf '        the apt-daily-upgrade drop-in is missing\n'
+    rc=1
+  }
+  [[ -f $daily ]] || {
+    printf '        the apt-daily drop-in is missing\n'
+    rc=1
+  }
+  grep -qF 'ExecStopPost=-/usr/local/sbin/shippi-report updates' "$upgrade" 2>/dev/null || {
+    printf '        the upgrade hook does not call shippi-report updates\n'
+    rc=1
+  }
+  grep -qF 'unit-failure --unit apt-daily.service' "$daily" 2>/dev/null || {
+    printf '        the package-list hook does not report apt-daily failures\n'
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_dry_run_updates_does_not_install_campfire_files() {
+  # --dry-run's guarantee is that nothing changes. The reporter and its
+  # systemd drop-ins are exactly the kind of "helpful" write that used to
+  # sneak past it.
+  setup_destdir
+  DRY_RUN=1
+  configure_updates >/dev/null 2>&1
+  local rc=0
+  [[ ! -e $CONF_DEST/usr/local/sbin/shippi-report ]] || {
+    printf '        a dry run installed the reporter\n'
+    rc=1
+  }
+  [[ ! -e $CONF_DEST/etc/systemd/system/apt-daily-upgrade.service.d/shippi-campfire.conf ]] || {
+    printf '        a dry run wrote the upgrade drop-in\n'
+    rc=1
+  }
+  teardown_destdir
+  return $rc
+}
+
+test_warn_calls_are_collected_for_notify() {
+  # --notify is only as good as the warning list. If warn() stops appending,
+  # a run can fail loudly on screen and still send "no warnings".
+  WARNINGS=()
+  local rc=0
+  warn "first warning" 2>/dev/null
+  warn "second warning" 2>/dev/null
+  ((${#WARNINGS[@]} == 2)) || rc=1
+  assert_eq "${WARNINGS[0]-}" "first warning" || rc=1
+  assert_eq "${WARNINGS[1]-}" "second warning" || rc=1
+  WARNINGS=()
+  return $rc
+}
+
+test_notify_warnings_sends_one_deduplicated_summary() {
+  # Two identical warnings are one issue, not two chat lines.
+  local rc=0 log="$TEST_TMP/notify-warnings.out"
+  cat >"$TEST_TMP/notifier" <<'EOF'
+#!/usr/bin/env bash
+cat >"$SHIPPI_NOTIFY_LOG"
+EOF
+  chmod +x "$TEST_TMP/notifier"
+  WARNINGS=("disk almost full" "disk almost full" "apparmor not loaded")
+  SHIPPI_REPORT_BIN="$TEST_TMP/notifier"
+  SHIPPI_NOTIFY_LOG="$log"
+  export SHIPPI_NOTIFY_LOG
+  notify_warnings >/dev/null 2>&1 || rc=1
+  [[ -f $log ]] || {
+    printf '        the notifier was not called\n'
+    rc=1
+  }
+  grep -q '2 warning(s)' "$log" 2>/dev/null || {
+    printf '        the summary did not report the deduplicated count\n'
+    rc=1
+  }
+  [[ $(grep -c '^- disk almost full' "$log" 2>/dev/null || true) -eq 1 ]] || {
+    printf '        the duplicate warning was not collapsed\n'
+    rc=1
+  }
+  grep -q '^- apparmor not loaded' "$log" 2>/dev/null || rc=1
+  WARNINGS=()
+  SHIPPI_REPORT_BIN=""
+  return $rc
+}
+
+test_notify_warnings_is_silent_when_clean() {
+  local rc=0 out
+  WARNINGS=()
+  SHIPPI_REPORT_BIN="$TEST_TMP/does-not-exist"
+  out="$(notify_warnings 2>&1)" || rc=1
+  [[ $out == *"no warnings to report"* ]] || {
+    printf '        a clean run did not say it had nothing to report: %s\n' "$out"
+    rc=1
+  }
+  SHIPPI_REPORT_BIN=""
+  return $rc
+}
+
+test_notify_warnings_does_not_post_without_a_reporter() {
+  # A missing shippi-report is a local deployment problem, not a reason to
+  # claim the warning summary was sent.
+  local rc=0 out
+  WARNINGS=("a warning")
+  SHIPPI_REPORT_BIN="$TEST_TMP/no-such-reporter"
+  out="$(notify_warnings 2>&1)" && rc=1
+  [[ $out == *"shippi-report was not found"* ]] || rc=1
+  WARNINGS=()
+  SHIPPI_REPORT_BIN=""
   return $rc
 }
 
@@ -3181,7 +3309,7 @@ test_audit_hints_show_where_to_edit() {
   [[ $body == *'config_hint /etc/ssh'* ]] || rc=1
   [[ $body == *'config_hint /etc/fail2ban'* ]] || rc=1
   [[ $body == *'config_hint /etc/sysctl.d'* ]] || rc=1
-  [[ $body == *'heading "filesystem & storage"'* ]] || rc=1
+  [[ $body == *'heading "filesystem"'* ]] || rc=1
   [[ $body != *'disk space on the boot filesystem matters'* ]] || rc=1
   [[ $body == *'heading "apparmor"'* ]] || rc=1
   [[ $body != *'heading "apparmour"'* ]] || rc=1
@@ -3683,6 +3811,69 @@ test_audit_flag_and_yes_skip_the_prompt() {
   teardown_destdir
   SELECTED=()
   RUN_AUDIT=0
+  return $rc
+}
+
+test_notify_flag_sends_a_summary_after_main() {
+  # --notify is a run-level switch: the warnings are collected across tasks,
+  # then sent once at the end. Sending per warn() would post a dozen messages
+  # for one run.
+  setup_destdir
+  stub_main_audit
+  ASSUME_YES=1
+  local rc=0 log="$TEST_TMP/notify-main.out"
+  cat >"$TEST_TMP/notifier" <<'EOF'
+#!/usr/bin/env bash
+cat >"$SHIPPI_NOTIFY_LOG"
+EOF
+  chmod +x "$TEST_TMP/notifier"
+  SHIPPI_REPORT_BIN="$TEST_TMP/notifier"
+  SHIPPI_NOTIFY_LOG="$log"
+  export SHIPPI_NOTIFY_LOG
+  WARNINGS=("a warning from the run")
+  main --notify >/dev/null 2>&1 || rc=1
+  [[ -f $log ]] || {
+    printf '        --notify did not call the reporter\n'
+    rc=1
+  }
+  # Other real tasks (password quality) may add warnings of their own, so
+  # assert the count is present rather than pinning it to the one fixture.
+  grep -Eq '[0-9]+ warning\(s\)' "$log" 2>/dev/null || {
+    printf '        the summary lost the warning count\n'
+    rc=1
+  }
+  grep -q 'a warning from the run' "$log" 2>/dev/null || {
+    printf '        the summary lost the warning text\n'
+    rc=1
+  }
+  WARNINGS=()
+  SHIPPI_REPORT_BIN=""
+  teardown_destdir
+  return $rc
+}
+
+test_notify_is_skipped_on_a_dry_run() {
+  # A plan that posts to chat is not a plan, it is a side effect.
+  setup_destdir
+  stub_main_audit
+  local rc=0 log="$TEST_TMP/notify-dry.out"
+  cat >"$TEST_TMP/notifier" <<'EOF'
+#!/usr/bin/env bash
+cat >"$SHIPPI_NOTIFY_LOG"
+EOF
+  chmod +x "$TEST_TMP/notifier"
+  SHIPPI_REPORT_BIN="$TEST_TMP/notifier"
+  SHIPPI_NOTIFY_LOG="$log"
+  export SHIPPI_NOTIFY_LOG
+  WARNINGS=("a warning")
+  main --notify --dry-run >/dev/null 2>&1 || rc=1
+  [[ ! -e $log ]] || {
+    printf '        a dry run posted a notification\n'
+    rc=1
+  }
+  WARNINGS=()
+  SHIPPI_REPORT_BIN=""
+  teardown_destdir
   return $rc
 }
 
@@ -5273,6 +5464,8 @@ t 'audit is offered after a default run'                 test_audit_prompt_offer
 t 'declining the audit runs nothing'                     test_audit_prompt_declined_runs_nothing
 t 'a task list without audit never offers it'            test_task_list_without_audit_skips_offer
 t '--audit and --yes skip the audit prompt'              test_audit_flag_and_yes_skip_the_prompt
+t '--notify sends one summary after main'                test_notify_flag_sends_a_summary_after_main
+t '--notify is silent on a dry run'                      test_notify_is_skipped_on_a_dry_run
 
 t 'the firewall loop visits every port'                 test_firewall_loop_visits_every_port
 t 'the firewall loop skips the ssh port'                test_firewall_skips_the_ssh_port
@@ -5369,6 +5562,12 @@ t 'ip_forward stays on when Docker runs'                test_ip_forward_never_di
 t 'ip_forward goes off when Docker absent'              test_ip_forward_zeroed_when_no_docker
 t 'docker_present needs no privilege'                   test_docker_present_needs_no_privilege
 t 'apt accepts the generated config'                    test_apt_config_parses_with_real_apt
+t 'updates installs the Campfire reporter + hooks'      test_updates_installs_campfire_reporter_and_hooks
+t 'a dry run writes no Campfire files'                  test_dry_run_updates_does_not_install_campfire_files
+t 'warn collects its warnings for --notify'             test_warn_calls_are_collected_for_notify
+t 'warning summaries are deduplicated'                  test_notify_warnings_sends_one_deduplicated_summary
+t 'a clean run has nothing to notify'                   test_notify_warnings_is_silent_when_clean
+t 'no reporter is a failure, not a sent message'        test_notify_warnings_does_not_post_without_a_reporter
 t 'rpi origin survives the spaces in "Raspberry Pi Foundation"' test_rpi_origin_combo_keeps_the_spaced_origin
 t 'a half-read release line yields no origin'          test_rpi_origin_combo_rejects_a_half_read_release_line
 t 'the rpi archive is auto-updated where present'       test_rpi_archive_is_allowed_when_this_box_has_it

@@ -8,7 +8,7 @@ just Bash.
 ## Project map
 
 - `bin/` — user-facing commands: `shippi-setup`, `shippi-harden`,
-  `shippi-refresh`, `shippi-ssh`, `shippi-help`.
+  `shippi-report`, `shippi-refresh`, `shippi-ssh`, `shippi-help`.
 - `install.sh` — installer entry point; sources the modules in `install/`:
   `debian.sh`, `docker.sh`, `binary.sh`, `config.sh`, `runtime.sh`,
   `ai-tools.sh`.
@@ -69,6 +69,8 @@ just Bash.
   results:
   - `./test/shippi-harden-test.sh` — for anything touching
     `bin/shippi-harden`.
+  - `./test/shippi-report-test.sh` — for anything touching
+    `bin/shippi-report` or the update-report hooks.
   - `./test/ai-tools-test.sh` — for anything touching
     `install/ai-tools.sh`.
 - Test files are self-contained Bash runners: they `source` the script under

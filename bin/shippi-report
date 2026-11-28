@@ -129,12 +129,18 @@ _config_load() {
 
   if [[ -f $CONFIG ]]; then
     # The file is sourced, so its contents execute. Refuse a config writable
-    # by group or other: the systemd hooks source it as root, and a writable
-    # file would let any local user run code as root on the next update.
-    local mode
+    # by group or other, or owned by neither root nor the current user: the
+    # systemd hooks source it as root, and a file another local user controls
+    # would run their code as root on the next update.
+    local mode owner
     mode="$(stat -c %a "$CONFIG" 2>/dev/null || true)"
+    owner="$(stat -c %u "$CONFIG" 2>/dev/null || true)"
     if [[ -n $mode ]] && (( 8#$mode & 022 )); then
       error "refusing to use ${CONFIG}: group- or world-writable (mode ${mode}); run: chmod 600 ${CONFIG}"
+      return 1
+    fi
+    if [[ -n $owner && $owner -ne 0 && $owner -ne $(id -u) ]]; then
+      error "refusing to use ${CONFIG}: owned by uid ${owner}, expected root or the current user"
       return 1
     fi
     # shellcheck disable=SC1090

@@ -239,6 +239,19 @@ test_world_writable_config_is_refused() {
   return $rc
 }
 
+test_nonroot_owned_config_is_refused_when_root() {
+  # The hooks source the config as root, so a file owned by a different user
+  # would run that user's code as root. Only verifiable as root.
+  [[ $(id -u) -eq 0 ]] || return 0
+  setup owner-check
+  chown 1000:1000 "$CONFIG" 2>/dev/null || return 0
+  local rc=0 out
+  out="$(main send "hello" 2>&1)" && rc=1
+  assert_contains "$out" "owned by uid" || rc=1
+  [[ ! -e $CASE_DIR/body ]] || rc=1
+  return $rc
+}
+
 test_dry_run_does_not_post_or_write_state() {
   setup dry-run
   local rc=0 out
@@ -745,6 +758,7 @@ _t 'executed updates runs under a lock'          test_executed_updates_serialize
 _t 'updates without config is a quiet no-op'     test_updates_without_config_is_a_quiet_noop
 _t 'a change without config explains itself'     test_updates_change_without_config_is_a_quiet_noop
 _t 'a world-writable config is refused'          test_world_writable_config_is_refused
+_t 'a non-root-owned config is refused as root'  test_nonroot_owned_config_is_refused_when_root
 _t 'a failed upgrade names packages to upgrade'   test_failed_upgrade_names_packages_to_upgrade
 _t 'unit failures do not clobber each other'     test_unit_failures_do_not_clobber_each_other
 

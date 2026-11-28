@@ -68,6 +68,26 @@ jobs:
             exit "$rc"
           fi
 
+      - name: Run shippi-report test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/shippi-report-test.log"
+
+          set +e
+          bash test/shippi-report-test.sh 2>&1 | tee "$log"
+          rc="${PIPESTATUS[0]}"
+          set -e
+
+          if ! grep -Eq '[0-9]+ passed, [0-9]+ failed' "$log"; then
+            echo "::error::the shippi-report suite printed no summary (exit $rc): it died before finishing"
+            exit 1
+          fi
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::the shippi-report suite failed (exit $rc); see the ok/FAIL lines above"
+            exit "$rc"
+          fi
+
       - name: Surface host-dependent tests that vacuous-skipped
         if: always()
         shell: bash

@@ -66,6 +66,7 @@ Shippi-server provides:
  - `shippi-refresh`: Reinstall Shippi with initial configs
  - `shippi-ssh`: Add SSH key for remote access
  - `shippi-harden`: One-time security hardening — run `shippi-harden`; it asks for sudo once. Use `--dry-run` first to see the plan. See the security hardening section for further details
+ - `shippi-report`: Send hardening warnings and unattended-update reports to a Campfire chat room. Silent on a clean update run; requires a Campfire bot key from `campfire-agents`
 
  - [opencode](https://opencode.ai/): alias `oc`
  - Claude: alias `cc=printf "\033[2J\033[3J\033[H" && claude --permission-mode bypassPermissions`
@@ -159,9 +160,11 @@ The audit is skipped by default and offered again at the end of a run; `--audit`
 runs it directly. It reports failed systemd units, whether a reboot is pending
 (with the packages that requested it), and whether the running kernel is the
 newest one installed — the three checks that matter most on a headless box
-after an update.
+after an update. `--notify` sends a deduplicated summary of the run's warnings
+to Campfire when `shippi-report` is configured; a run with no warnings sends
+nothing.
 
-The `filesystem & storage` section shows free space for `/`, `/boot` and
+The `filesystem` section shows free space for `/`, `/boot` and
 `/boot/firmware` (whichever are separate mounts), the kernel versions and
 images accumulating in `/boot`, and world-writable files outside homes,
 caches, temp dirs, and container layers. A boot filesystem under 100M free or
@@ -273,6 +276,17 @@ Some deliberate choices worth knowing before you run it:
   reads. The audit also reports `/var/run/reboot-required` and the packages
   that set it, because a package-owned `/boot` with zero pending updates still
   looks clean while a just-installed kernel waits for a reboot.
+- **Security events can go to Campfire.** `shippi-report` posts to a Campfire
+  bot room when `shippi-harden --notify` emitted warnings, or when the daily
+  unattended-upgrades run installed packages, kept packages back, or failed.
+  A clean update run is silent, and the state file prevents the same run being
+  posted twice. `shippi-harden updates` installs the reporter at
+  `/usr/local/sbin/shippi-report` and adds `ExecStopPost` hooks to
+  `apt-daily.service` and `apt-daily-upgrade.service`, so this works without
+  the user's home directory being mounted or on root's `PATH`. The bot key
+  lives in `/etc/shippi/campfire-notify.conf` (mode `0600`); the `Shippi` bot
+  and that config are created by
+  `campfire-agents/scripts/install-shippi-notifier.sh`.
 - **`net.ipv4.ip_forward` is left alone** when the Docker service is *running*,
   since the container bridge needs it. If Docker is installed but stopped when
   you run the script, forwarding is turned off; start Docker and re-run if that

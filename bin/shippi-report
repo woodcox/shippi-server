@@ -1,0 +1,742 @@
+#!/usr/bin/env bash
+#
+# shippi-report - outbound reports to a Campfire chat room.
+#
+# shippi-harden is the only thing on this box that changes security policy,
+# and unattended-upgrades is the only thing that applies patches without a
+# human present. Both used to report to stdout or root's local mail spool,
+# which nobody reads on a headless Pi. This command is the one place that
+# knows how to put a message in a Campfire room, so a hardening run and the
+# daily update hook cannot drift apart.
+#
+# The bot key is a credential. It lives in a root-owned 0600 config file
+# (/etc/shippi/campfire-notify.conf by default), never in a systemd unit, a
+# world-readable file, or this script. The Campfire bot API authenticates the
+# key in the URL path, so that file is the whole of the trust boundary.
+#
+# Design notes:
+#   * Stdlib-free: curl is already a hardening dependency, and the bot API is
+#     one POST. shippi-server is a pure-Bash project; adding Python here would
+#     make a hardening script depend on the agent bridge's runtime.
+#   * "Issues and changes only": a clean unattended-upgrades run posts
+#     nothing. The state file records the last run that was reported, so a
+#     retry or a manual invocation does not duplicate it.
+#   * A reporting failure must never fail the thing being reported on. The
+#     systemd hooks use ExecStopPost=- and this script exits 0 when the
+#     notifier is simply not configured.
+set -euo pipefail
+
+CONFIG_DEFAULT="/etc/shippi/campfire-notify.conf"
+# Campfire accepts much more, but a journal-sized wall of text is not a chat
+# message. Leave room for the summary and truncate only the pathological case.
+MAX_CHARS=6000
+# The unattended-upgrades log, not the dpkg log: it carries the per-run
+# "Starting..." and "Packages that will be upgraded:" lines this parser needs.
+UPGRADE_LOG="${SHIPPI_UNATTENDED_LOG:-/var/log/unattended-upgrades/unattended-upgrades.log}"
+
+CONFIG="${SHIPPI_CAMPFIRE_CONFIG:-$CONFIG_DEFAULT}"
+CURL_BIN="${SHIPPI_CURL:-curl}"
+DOCKER_BIN="${SHIPPI_DOCKER:-docker}"
+DRY_RUN=0
+
+SHIPPI_CAMPFIRE_URL="${SHIPPI_CAMPFIRE_URL:-}"
+SHIPPI_CAMPFIRE_ROOM="${SHIPPI_CAMPFIRE_ROOM:-}"
+SHIPPI_CAMPFIRE_BOT_KEY="${SHIPPI_CAMPFIRE_BOT_KEY:-}"
+SHIPPI_CAMPFIRE_CONTAINER="${SHIPPI_CAMPFIRE_CONTAINER:-}"
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+error() { printf 'shippi-report: %s\n' "$1" >&2; }
+note() { printf '%s\n' "$1" >&2; }
+
+usage() {
+  cat <<'EOF'
+shippi report to Campfire
+
+Usage:
+  shippi-report [--config PATH] [--dry-run] <command> [args]
+
+Commands:
+  send [text|-]        send text (reads stdin when omitted or "-")
+  updates [--force]    report the last unattended-upgrades run if it
+                       installed, auto-removed or kept back packages, or
+                       failed; quiet otherwise
+  unit-failure         report a failed systemd unit (used by the
+    [--unit UNIT]      apt-daily.service hook)
+    [--force]
+  test                 send a test message and exit non-zero on failure
+
+Options:
+  --config PATH        config file (default: /etc/shippi/campfire-notify.conf)
+  --dry-run            print the message instead of posting it
+  -h, --help           this text
+
+Configuration:
+  The file is sourced by this script and must be root-owned mode 0600:
+
+    SHIPPI_CAMPFIRE_URL=auto
+    SHIPPI_CAMPFIRE_ROOM=2
+    SHIPPI_CAMPFIRE_BOT_KEY=3-...
+
+  The Shippi bot and this config are created by
+  campfire-agents/scripts/install-shippi-notifier.sh (which runs
+  setup_campfire.rb and writes this file). The same SHIPPI_CAMPFIRE_* names
+  can be supplied as environment variables, which override the file.
+
+Automatic update reports:
+  `shippi-harden updates` installs this command at /usr/local/sbin and adds
+  ExecStopPost hooks to apt-daily.service and apt-daily-upgrade.service.
+  A clean run stays silent; installed packages, a failed unit, or a pending
+  reboot produce one message. `shippi-harden --notify` does the same for
+  warnings emitted during a hardening run.
+
+Examples:
+  sudo shippi-report test
+  sudo shippi-report updates --force
+  shippi-report send "backup finished on the Pi"
+  printf 'hello\n' | shippi-report send
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Config and transport
+# ---------------------------------------------------------------------------
+_hostname() { hostname 2>/dev/null || uname -n; }
+
+_valid_room() { [[ ${SHIPPI_CAMPFIRE_ROOM:-} =~ ^[0-9]+$ ]]; }
+
+# The bot key is "<user id>-<token>". It goes straight into a URL path, so
+# reject anything that could change the URL's meaning rather than relying on
+# Campfire to reject a malformed request.
+_valid_key() {
+  [[ ${SHIPPI_CAMPFIRE_BOT_KEY:-} =~ ^[0-9]+-[A-Za-z0-9_-]+$ ]]
+}
+
+# Load the config file, allowing environment variables to win. A missing
+# file is not an error here: the callers decide whether the absence is fatal
+# (an explicit send) or just a quiet no-op (the daily hook before setup).
+_config_load() {
+  local env_url="${SHIPPI_CAMPFIRE_URL-}"
+  local env_room="${SHIPPI_CAMPFIRE_ROOM-}"
+  local env_key="${SHIPPI_CAMPFIRE_BOT_KEY-}"
+  local env_container="${SHIPPI_CAMPFIRE_CONTAINER-}"
+
+  SHIPPI_CAMPFIRE_URL="${SHIPPI_CAMPFIRE_URL:-auto}"
+  SHIPPI_CAMPFIRE_ROOM="${SHIPPI_CAMPFIRE_ROOM:-}"
+  SHIPPI_CAMPFIRE_BOT_KEY="${SHIPPI_CAMPFIRE_BOT_KEY:-}"
+  SHIPPI_CAMPFIRE_CONTAINER="${SHIPPI_CAMPFIRE_CONTAINER:-once-campfire}"
+
+  if [[ -f $CONFIG ]]; then
+    # The file is sourced, so its contents execute. Refuse a config writable
+    # by group or other, or owned by neither root nor the current user: the
+    # systemd hooks source it as root, and a file another local user controls
+    # would run their code as root on the next update.
+    local mode owner
+    mode="$(stat -c %a "$CONFIG" 2>/dev/null || true)"
+    owner="$(stat -c %u "$CONFIG" 2>/dev/null || true)"
+    if [[ -n $mode ]] && (( 8#$mode & 022 )); then
+      error "refusing to use ${CONFIG}: group- or world-writable (mode ${mode}); run: chmod 600 ${CONFIG}"
+      return 1
+    fi
+    if [[ -n $owner && $owner -ne 0 && $owner -ne $(id -u) ]]; then
+      error "refusing to use ${CONFIG}: owned by uid ${owner}, expected root or the current user"
+      return 1
+    fi
+    # shellcheck disable=SC1090
+    if ! . "$CONFIG"; then
+      error "could not read ${CONFIG}"
+      return 1
+    fi
+  fi
+
+  [[ -n $env_url ]] && SHIPPI_CAMPFIRE_URL="$env_url"
+  [[ -n $env_room ]] && SHIPPI_CAMPFIRE_ROOM="$env_room"
+  [[ -n $env_key ]] && SHIPPI_CAMPFIRE_BOT_KEY="$env_key"
+  [[ -n $env_container ]] && SHIPPI_CAMPFIRE_CONTAINER="$env_container"
+
+  _valid_room || {
+    error "no valid Campfire room id (set SHIPPI_CAMPFIRE_ROOM in ${CONFIG})"
+    return 1
+  }
+  _valid_key || {
+    error "no valid Campfire bot key (set SHIPPI_CAMPFIRE_BOT_KEY in ${CONFIG})"
+    return 1
+  }
+  case "${SHIPPI_CAMPFIRE_URL}" in
+    auto | http://* | https://*) ;;
+    *)
+      error "SHIPPI_CAMPFIRE_URL must be an http(s) URL or 'auto', got '${SHIPPI_CAMPFIRE_URL}'"
+      return 1
+      ;;
+  esac
+}
+
+_redact() {
+  local text="$1"
+  if [[ -n ${SHIPPI_CAMPFIRE_BOT_KEY:-} ]]; then
+    text="${text//"$SHIPPI_CAMPFIRE_BOT_KEY"/<redacted>}"
+  fi
+  printf '%s' "$text"
+}
+
+# ONCE runs Campfire without a published host port, so the stable address is
+# the container's Docker-network IP. Every call rediscovers rather than
+# caching: this runs once a day, and a cached IP from before an ONCE update
+# would silently send every future report into a dead address.
+_discover_base_url() {
+  local candidates id ip
+  candidates="$("$DOCKER_BIN" ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}' 2>/dev/null || true)"
+  id="$(printf '%s\n' "$candidates" | awk -F'\t' -v hint="$SHIPPI_CAMPFIRE_CONTAINER" '
+    index($2, hint) || index($3, hint) { print $1; exit }
+  ')"
+  if [[ -z $id ]]; then
+    error "could not find the Campfire container matching '${SHIPPI_CAMPFIRE_CONTAINER}'"
+    return 1
+  fi
+  ip="$("$DOCKER_BIN" inspect --format \
+    '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' \
+    "$id" 2>/dev/null | awk 'NF { print; exit }')"
+  if [[ -z $ip ]]; then
+    error "the Campfire container has no Docker-network address"
+    return 1
+  fi
+  printf 'http://%s\n' "$ip"
+}
+
+_campfire_base_url() {
+  local url="${SHIPPI_CAMPFIRE_URL:-auto}"
+  if [[ -z $url || $url == auto ]]; then
+    url="$(_discover_base_url)" || return 1
+  fi
+  case "$url" in
+    http://* | https://*) ;;
+    *)
+      error "SHIPPI_CAMPFIRE_URL must be an http(s) URL or 'auto', got '${url}'"
+      return 1
+      ;;
+  esac
+  printf '%s\n' "${url%/}"
+}
+
+_campfire_post() {
+  local body
+  body="$(cat)"
+  [[ -n ${body//[[:space:]]/} ]] || return 0
+
+  if ((${#body} > MAX_CHARS)); then
+    body="${body:0:MAX_CHARS}"$'\n… (truncated)'
+  fi
+
+  if ((DRY_RUN)); then
+    printf 'would post to Campfire room %s:\n%s\n' "$SHIPPI_CAMPFIRE_ROOM" "$body"
+    return 0
+  fi
+
+  local url status err_file err
+  url="$(_campfire_base_url)" || return 1
+  err_file="$(mktemp)" || {
+    error "could not create a temporary file"
+    return 1
+  }
+  if status="$(
+    printf '%s' "$body" | "$CURL_BIN" -sS -o /dev/null -w '%{http_code}' \
+      --max-time 20 -X POST \
+      -H 'Content-Type: text/plain; charset=utf-8' \
+      -H 'Accept: application/json' \
+      --data-binary @- \
+      "${url}/rooms/${SHIPPI_CAMPFIRE_ROOM}/${SHIPPI_CAMPFIRE_BOT_KEY}/messages.json" \
+      2>"$err_file"
+  )"; then
+    :
+  else
+    err="$(cat "$err_file" 2>/dev/null || true)"
+    rm -f "$err_file"
+    error "Campfire request failed: $(_redact "${err:-curl exited non-zero}")"
+    return 1
+  fi
+  rm -f "$err_file"
+
+  case "$status" in
+    200 | 201 | 204) return 0 ;;
+    *)
+      error "Campfire returned HTTP ${status}"
+      return 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+_state_dir() {
+  local dir
+  if [[ -n ${SHIPPI_REPORT_STATE_DIR:-} ]]; then
+    dir="$SHIPPI_REPORT_STATE_DIR"
+  elif [[ $(id -u) -eq 0 ]]; then
+    dir="/var/lib/shippi-report"
+  else
+    dir="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/shippi-report"
+  fi
+  if ! install -d -m 0700 "$dir" 2>/dev/null; then
+    error "could not create the report state directory ${dir}"
+    return 1
+  fi
+  printf '%s\n' "$dir"
+}
+
+_state_file() {
+  local dir
+  dir="$(_state_dir)" || return 1
+  printf '%s/%s.state\n' "$dir" "$1"
+}
+
+_already_sent() {
+  # A dry run must not create the state directory just to decide whether a
+  # real run would have posted.
+  ((DRY_RUN)) && return 1
+  local name="$1" key="$2" file
+  file="$(_state_file "$name")" || return 1
+  [[ -f $file ]] && [[ "$(cat "$file" 2>/dev/null || true)" == "$key" ]]
+}
+
+_mark_sent() {
+  # Likewise, previewing a report must not consume it: the next real
+  # invocation has to deliver it.
+  ((DRY_RUN)) && return 0
+  local name="$1" key="$2" file tmp
+  file="$(_state_file "$name")" || return 1
+  tmp="${file}.tmp.$$"
+  if (umask 077; printf '%s\n' "$key" >"$tmp") && mv -f "$tmp" "$file"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  error "could not record the report state in ${file}"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# unattended-upgrades
+# ---------------------------------------------------------------------------
+# Print the last run as six US-separated fields: start line, state
+# (changed, none, error), upgraded packages, auto-removed packages, packages
+# kept back, error lines. The last "Starting" marker wins, so a log that has
+# not rotated yet never mixes two runs.
+#
+# "Packages that are kept back" is a change worth reporting even without an
+# error: those packages will never be installed by unattended-upgrades, and
+# the run still exits 0. The log records them on a line of their own, which is
+# why the summary cannot be built from the exit status alone.
+_parse_last_upgrade() {
+  # Read the override at call time, not source time: the tests and a manual
+  # `SHIPPI_UNATTENDED_LOG=... shippi-report updates` both rely on changing it
+  # after the script has loaded.
+  local log="${1:-${SHIPPI_UNATTENDED_LOG:-$UPGRADE_LOG}}" parsed
+  [[ -r $log ]] || return 1
+  parsed="$(awk '
+    /INFO Starting unattended upgrades script/ {
+      start = $0; pkg = ""; removed = ""; kept = ""; state = "none"; err = ""
+      next
+    }
+    start == "" { next }
+    /INFO Packages that will be upgraded:/ {
+      pkg = $0
+      sub(/^.*upgraded:[[:space:]]*/, "", pkg)
+      sub(/[[:space:]]+$/, "", pkg)
+      if (pkg != "") state = "changed"
+      next
+    }
+    /INFO Packages that were successfully auto-removed:/ {
+      removed = $0
+      sub(/^.*auto-removed:[[:space:]]*/, "", removed)
+      sub(/[[:space:]]+$/, "", removed)
+      if (removed != "" && state != "error") state = "changed"
+      next
+    }
+    /INFO Packages that are kept back:/ {
+      kept = $0
+      sub(/^.*kept back:[[:space:]]*/, "", kept)
+      sub(/[[:space:]]+$/, "", kept)
+      if (kept != "" && state != "error") state = "changed"
+      next
+    }
+    /INFO No packages found that can be upgraded/ {
+      if (state != "error") state = "none"
+      next
+    }
+    /INFO All upgrades installed/ {
+      # Completion marker only. Installing nothing still prints this line on
+      # some unattended-upgrades versions, and a report with no package names
+      # is worse than silence.
+      next
+    }
+    /(ERROR|Traceback \(most recent call last\))/ {
+      err = (err == "" ? $0 : err "\n" $0)
+      state = "error"
+    }
+    END {
+      if (start == "") exit 1
+      printf "%s\034%s\034%s\034%s\034%s\034%s", start, state, pkg, removed, kept, err
+    }
+  ' "$log")" || return 1
+  printf '%s\n' "$parsed"
+}
+
+_reboot_flag() {
+  printf '%s\n' "${SHIPPI_REBOOT_REQUIRED:-/var/run/reboot-required}"
+}
+
+_reboot_note() {
+  local flag pkgs_file
+  flag="$(_reboot_flag)"
+  [[ -e $flag ]] || return 0
+  pkgs_file="${SHIPPI_REBOOT_REQUIRED_PKGS:-/var/run/reboot-required.pkgs}"
+  local pkgs=""
+  if [[ -r $pkgs_file ]]; then
+    pkgs="$(awk 'NF && !seen[$0]++ { printf "%s%s", sep, $0; sep = " " }' \
+      "$pkgs_file" 2>/dev/null || true)"
+  fi
+  if [[ -n $pkgs ]]; then
+    printf 'Reboot required (%s).\n' "$pkgs"
+  else
+    printf 'Reboot required.\n'
+  fi
+}
+
+# A reboot can be pending after a manual upgrade that installed no packages
+# unattended, so it is an issue on its own, independent of the package report.
+# Key the dedupe on the flag's mtime: a new kernel that requests a new reboot
+# moves it.
+_report_pending_reboot() {
+  local reboot="$1" force="$2"
+  [[ -n $reboot ]] || return 0
+  local flag reboot_key
+  flag="$(_reboot_flag)"
+  reboot_key="reboot:$(stat -c %Y "$flag" 2>/dev/null || echo unknown)"
+  if ((!force)) && _already_sent reboot "$reboot_key"; then
+    note "the pending reboot was already reported"
+    return 0
+  fi
+  if ! _config_load; then
+    note "Campfire reporting is not configured; nothing sent"
+    return 0
+  fi
+  printf '%s\n' "$(_hostname) — ${reboot%$'\n'}" | _campfire_post || return 1
+  _mark_sent reboot "$reboot_key" || true
+}
+
+# One message for a failed unit. The invocation id, when systemd supplies
+# one, is the deduplication key: the same failure is not posted twice when
+# the unit is stopped again or the hook is retried.
+_report_unit_failure() {
+  local unit="$1" result="$2" exit_code="$3" exit_status="$4"
+  local invocation="$5" force="$6" key body detail errors=""
+  key="unit:${unit}:${invocation:-${result}:${exit_status}}"
+
+  # A unit failure and an upgrade run are different reports, and two different
+  # units are different reports too. Sharing one state file meant an apt-daily
+  # failure overwrote the apt-daily-upgrade key and the same issue was posted
+  # again. Scope the dedupe state to the unit.
+  if ((!force)) && _already_sent "unit-${unit}" "$key"; then
+    note "${unit} failure already reported"
+    return 0
+  fi
+
+  # Load the bot config only once there is something to say. A clean run on a
+  # box that never configured Campfire must not write a daily "not configured"
+  # line into the journal.
+  if ! _config_load; then
+    note "Campfire reporting is not configured; nothing sent"
+    return 0
+  fi
+
+  detail="$result"
+  if [[ -n $exit_code ]]; then
+    detail+=", ${exit_code} ${exit_status:-?}"
+  fi
+  body="$(_hostname) — ${unit} failed (${detail})."
+  if [[ $unit == apt-daily.service ]]; then
+    body+=$'\n'"Package lists may be stale; unattended upgrades could miss security updates."
+  elif [[ $unit == apt-daily-upgrade.service ]]; then
+    # A failed run still has an Installed/Auto-removed/Kept-back list worth
+    # naming: "failed" alone hides whether anything was installed first. The
+    # one post carries the same fields a clean run would.
+    local parsed
+    if parsed="$(_parse_last_upgrade 2>/dev/null || true)" && [[ -n $parsed ]]; then
+      local -a fields=()
+      mapfile -d $'\034' -t fields <<<"$parsed"
+      local pkg="${fields[2]:-}" removed="${fields[3]:-}" kept="${fields[4]:-}"
+      errors="${fields[5]:-}"
+      errors="${errors%$'\n'}"
+      if [[ -n $pkg ]]; then
+        # The "will be upgraded" list is a plan, not a completion, so a failed
+        # run must not claim these were installed.
+        body+=$'\n'"Packages to upgrade: ${pkg}"
+      fi
+      if [[ -n $removed ]]; then
+        body+=$'\n'"Auto-removed: ${removed}"
+      fi
+      if [[ -n $kept ]]; then
+        body+=$'\n'"Kept back (will not be installed unattended): ${kept}"
+      fi
+      if [[ -n $errors ]]; then
+        body+=$'\n'"Last errors:"$'\n'"$errors"
+      fi
+    fi
+  fi
+
+  printf '%s\n' "$body" | _campfire_post || return 1
+  _mark_sent "unit-${unit}" "$key" || true
+}
+
+_updates_result() {
+  local result="${SERVICE_RESULT:-}"
+  local exit_code="${EXIT_CODE:-}"
+  local exit_status="${EXIT_STATUS:-}"
+  local invocation="${INVOCATION_ID:-}"
+
+  # Outside an ExecStopPost hook (a manual run) systemd supplies none of
+  # these. Read the unit's last result instead of inventing "unknown".
+  if [[ -z $result ]]; then
+    result="$(systemctl show -p Result --value apt-daily-upgrade.service 2>/dev/null || true)"
+    invocation="$(systemctl show -p InvocationID --value apt-daily-upgrade.service 2>/dev/null || true)"
+  fi
+  printf '%s\034%s\034%s\034%s\n' "$result" "$exit_code" "$exit_status" "$invocation"
+}
+
+cmd_updates() {
+  local force=0
+  while (($#)); do
+    case "$1" in
+      --force) force=1 ;;
+      *) error "unknown updates option: $1"; return 2 ;;
+    esac
+    shift
+  done
+
+  local result exit_code exit_status invocation parsed
+  IFS=$'\034' read -r result exit_code exit_status invocation <<<"$(_updates_result)"
+
+  if [[ -n $result && $result != success ]]; then
+    _report_unit_failure apt-daily-upgrade.service \
+      "$result" "$exit_code" "$exit_status" "$invocation" "$force"
+    return
+  fi
+
+  # A reboot is reported independently of the package run: a manual upgrade can
+  # create the flag without changing the unattended-upgrades log, and the run
+  # that already posted the packages must not suppress the newer reboot.
+  local reboot
+  reboot="$(_reboot_note || true)"
+  _report_pending_reboot "$reboot" "$force" || return 1
+
+  parsed="$(_parse_last_upgrade)" || {
+    note "no unattended-upgrades run found in ${SHIPPI_UNATTENDED_LOG:-$UPGRADE_LOG}; nothing sent"
+    return 0
+  }
+  local -a fields=()
+  mapfile -d $'\034' -t fields <<<"$parsed"
+  local start="${fields[0]:-}" state="${fields[1]:-}" pkg="${fields[2]:-}"
+  local removed="${fields[3]:-}" kept="${fields[4]:-}" errors="${fields[5]:-}"
+  errors="${errors%$'\n'}"
+
+  # A clean run with no package changes is not news (the reboot, if any, was
+  # already handled above). Do not write state: a changed run is the only case
+  # that must not be repeated.
+  if [[ $state == none ]]; then
+    return 0
+  fi
+
+  local key="run:${start}"
+  if ((!force)) && _already_sent updates "$key"; then
+    note "that unattended-upgrades run was already reported"
+    return 0
+  fi
+
+  if ! _config_load; then
+    note "Campfire reporting is not configured; nothing sent"
+    return 0
+  fi
+
+  local when body
+  when="${start%% INFO *}"
+  body="$(_hostname) — unattended upgrades ${when}"
+  if [[ -n $pkg ]]; then
+    body+=$'\n'"Installed: ${pkg}"
+  fi
+  if [[ -n $removed ]]; then
+    body+=$'\n'"Auto-removed: ${removed}"
+  fi
+  if [[ -n $kept ]]; then
+    body+=$'\n'"Kept back (will not be installed unattended): ${kept}"
+  fi
+  if [[ -n $errors ]]; then
+    body+=$'\n'"Errors:"$'\n'"$errors"
+  fi
+
+  printf '%s\n' "$body" | _campfire_post || return 1
+  _mark_sent updates "$key" || true
+}
+
+cmd_unit_failure() {
+  local unit="apt-daily.service" force=0
+  while (($#)); do
+    case "$1" in
+      --unit)
+        if (($# < 2)) || [[ -z ${2:-} ]]; then
+          error "--unit needs a unit name"
+          return 2
+        fi
+        unit="$2"
+        shift
+        ;;
+      --force) force=1 ;;
+      *) error "unknown unit-failure option: $1"; return 2 ;;
+    esac
+    shift
+  done
+
+  if [[ ! $unit =~ ^[A-Za-z0-9@._:-]+$ ]]; then
+    error "invalid unit name: ${unit}"
+    return 2
+  fi
+
+  local result="${SERVICE_RESULT:-}"
+  local exit_code="${EXIT_CODE:-}"
+  local exit_status="${EXIT_STATUS:-}"
+  local invocation="${INVOCATION_ID:-}"
+  if [[ -z $result ]]; then
+    result="$(systemctl show -p Result --value "$unit" 2>/dev/null || true)"
+    invocation="$(systemctl show -p InvocationID --value "$unit" 2>/dev/null || true)"
+  fi
+
+  # Silence is the correct report for success, and "could not determine" is
+  # not a failure: a box without the unit is not an update problem.
+  [[ $result == success || -z $result ]] && return 0
+  _report_unit_failure "$unit" "$result" "$exit_code" "$exit_status" "$invocation" "$force"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_send() {
+  local text=""
+  if (($# == 1)) && [[ ${1:-} == - ]]; then
+    # The usage documents `send -` as explicit stdin. Without this branch a
+    # pipe posts the literal "-".
+    if [[ -t 0 ]]; then
+      error "send - needs a message on stdin"
+      return 2
+    fi
+    text="$(cat)"
+  elif (($#)); then
+    text="$*"
+  else
+    if [[ -t 0 ]]; then
+      error "no message; pass text or pipe it on stdin"
+      return 2
+    fi
+    text="$(cat)"
+  fi
+  if [[ -z ${text//[[:space:]]/} ]]; then
+    error "refusing to send an empty message"
+    return 2
+  fi
+  _config_load || return 1
+  printf '%s' "$text" | _campfire_post
+}
+
+cmd_test() {
+  _config_load || return 1
+  printf 'shippi-report test from %s: Campfire reporting works.\n' "$(_hostname)" |
+    _campfire_post
+}
+
+main() {
+  local command="" args=()
+  local -a original=("$@")
+  while (($#)); do
+    case "$1" in
+      --config)
+        if (($# < 2)) || [[ -z ${2:-} ]]; then
+          error "--config needs a path"
+          return 2
+        fi
+        CONFIG="$2"
+        shift
+        ;;
+      --dry-run) DRY_RUN=1 ;;
+      -h | --help)
+        usage
+        return 0
+        ;;
+      --)
+        shift
+        args+=("$@")
+        break
+        ;;
+      -*)
+        # Command flags (--unit, --force, --room, ...) belong to the command
+        # that follows, so only reject an option before the command is known.
+        if [[ -n $command ]]; then
+          args+=("$1")
+        else
+          error "unknown option: $1"
+          usage >&2
+          return 2
+        fi
+        ;;
+      *)
+        if [[ -z $command ]]; then
+          command="$1"
+        else
+          args+=("$1")
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -z $command ]]; then
+    usage >&2
+    return 2
+  fi
+
+  # Serialize the state check, POST and state write for the reporting
+  # commands. Two overlapping runs could both read "not sent" before either
+  # records the key, and the POST can take up to 20 seconds. Re-exec under
+  # flock so the lock covers the whole decision and delivery.
+  #
+  # Sourced callers (the test suite) skip this: $0 is the test runner, not
+  # this script.
+  if [[ -z ${SHIPPI_REPORT_LOCKED:-} ]] && ((!DRY_RUN)) &&
+    [[ ${BASH_SOURCE[0]} == "${0}" ]] &&
+    [[ $command == updates || $command == unit-failure ]] &&
+    command -v flock >/dev/null 2>&1; then
+    local lockdir lock
+    lockdir="$(_state_dir)" || return 1
+    lock="${lockdir}/report.lock"
+    export SHIPPI_REPORT_LOCKED=1
+    flock -w 60 "$lock" "$0" "${original[@]}"
+    return $?
+  fi
+
+  case "$command" in
+    send) cmd_send "${args[@]+"${args[@]}"}" ;;
+    updates) cmd_updates "${args[@]+"${args[@]}"}" ;;
+    unit-failure) cmd_unit_failure "${args[@]+"${args[@]}"}" ;;
+    test) cmd_test ;;
+    *)
+      error "unknown command: ${command}"
+      usage >&2
+      return 2
+      ;;
+  esac
+}
+
+# Sourcing this file gives the functions without running anything, which is
+# how the test suite exercises the parser and the transport without a live
+# Campfire or a root-owned config.
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+  main "$@"
+fi

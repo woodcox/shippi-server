@@ -121,7 +121,11 @@ setup() {
   EXIT_CODE="exited"
   EXIT_STATUS="0"
   INVOCATION_ID=""
+  # Keep the host's real /var/run/reboot-required out of every assertion.
+  SHIPPI_REBOOT_REQUIRED="$CASE_DIR/no-reboot-required"
+  SHIPPI_REBOOT_REQUIRED_PKGS="$CASE_DIR/no-reboot-pkgs"
   export SERVICE_RESULT EXIT_CODE EXIT_STATUS INVOCATION_ID
+  export SHIPPI_REBOOT_REQUIRED SHIPPI_REBOOT_REQUIRED_PKGS
 }
 
 # ---------------------------------------------------------------------------
@@ -166,6 +170,15 @@ test_send_reads_stdin() {
   local rc=0
   printf 'from a pipe\n' | main send >/dev/null 2>&1 || rc=1
   assert_eq "$(cat "$CASE_DIR/body" 2>/dev/null)" "from a pipe" || rc=1
+  return $rc
+}
+
+test_send_dash_reads_stdin() {
+  # The usage advertises `send -`; a literal "-" is not a message.
+  setup send-dash
+  local rc=0
+  printf 'from stdin\n' | main send - >/dev/null 2>&1 || rc=1
+  assert_eq "$(cat "$CASE_DIR/body" 2>/dev/null)" "from stdin" || rc=1
   return $rc
 }
 
@@ -400,6 +413,101 @@ test_apt_daily_failure_names_stale_lists() {
   return $rc
 }
 
+test_updates_dry_run_writes_no_state() {
+  # A preview must not create the state directory, and it certainly must not
+  # record the run as delivered.
+  setup updates-dry
+  cat >"$SHIPPI_UNATTENDED_LOG" <<'EOF'
+2026-11-28 06:00:00,000 INFO Starting unattended upgrades script
+2026-11-28 06:00:01,000 INFO Packages that will be upgraded: bash
+2026-11-28 06:00:02,000 INFO All upgrades installed
+EOF
+  local rc=0 out
+  out="$(main --dry-run updates 2>&1)" || rc=1
+  assert_contains "$out" "would post" || rc=1
+  [[ ! -e $SHIPPI_REPORT_STATE_DIR ]] || {
+    printf '        a dry run created state\n'
+    rc=1
+  }
+  [[ ! -e $CASE_DIR/body ]] || {
+    printf '        a dry run posted\n'
+    rc=1
+  }
+  return $rc
+}
+
+test_unit_failure_dry_run_writes_no_state() {
+  setup unit-dry
+  SERVICE_RESULT="exit-code" EXIT_CODE="exited" EXIT_STATUS="100" INVOCATION_ID="inv-dry"
+  export SERVICE_RESULT EXIT_CODE EXIT_STATUS INVOCATION_ID
+  local rc=0 out
+  out="$(main --dry-run unit-failure --unit apt-daily.service 2>&1)" || rc=1
+  assert_contains "$out" "would post" || rc=1
+  [[ ! -e $SHIPPI_REPORT_STATE_DIR ]] || {
+    printf '        a dry run created state\n'
+    rc=1
+  }
+  [[ ! -e $CASE_DIR/body ]] || {
+    printf '        a dry run posted\n'
+    rc=1
+  }
+  return $rc
+}
+
+test_reboot_only_is_reported_once() {
+  # A manual upgrade can leave a reboot pending with no unattended package
+  # changes. That is still an issue, and it must not be reported every day.
+  setup reboot-only
+  cat >"$SHIPPI_UNATTENDED_LOG" <<'EOF'
+2026-11-28 06:00:00,000 INFO Starting unattended upgrades script
+2026-11-28 06:00:01,000 INFO No packages found that can be upgraded and no pending auto-removals
+EOF
+  printf 'linux-image-test\n' >"$SHIPPI_REBOOT_REQUIRED_PKGS"
+  : >"$SHIPPI_REBOOT_REQUIRED"
+  local rc=0 body
+  main updates >/dev/null 2>&1 || rc=1
+  body="$(cat "$CASE_DIR/body" 2>/dev/null)"
+  assert_contains "$body" "no package changes" || rc=1
+  assert_contains "$body" "Reboot required (linux-image-test)" || rc=1
+  : >"$CASE_DIR/body"
+  main updates >/dev/null 2>&1 || rc=1
+  [[ ! -s $CASE_DIR/body ]] || {
+    printf '        the pending reboot was reported twice\n'
+    rc=1
+  }
+  return $rc
+}
+
+test_unit_failure_does_not_clobber_upgrade_state() {
+  # A daily apt-daily failure used to overwrite updates.state, so the next
+  # successful update check re-posted an unchanged run.
+  setup state-split
+  cat >"$SHIPPI_UNATTENDED_LOG" <<'EOF'
+2026-11-28 06:00:00,000 INFO Starting unattended upgrades script
+2026-11-28 06:00:01,000 INFO Packages that will be upgraded: bash
+2026-11-28 06:00:02,000 INFO All upgrades installed
+EOF
+  local rc=0
+  main updates >/dev/null 2>&1 || rc=1
+  [[ -s $CASE_DIR/body ]] || rc=1
+  : >"$CASE_DIR/body"
+
+  SERVICE_RESULT="exit-code" EXIT_CODE="exited" EXIT_STATUS="100" INVOCATION_ID="inv-split"
+  export SERVICE_RESULT EXIT_CODE EXIT_STATUS INVOCATION_ID
+  main unit-failure --unit apt-daily.service >/dev/null 2>&1 || rc=1
+  [[ -s $CASE_DIR/body ]] || rc=1
+  : >"$CASE_DIR/body"
+
+  SERVICE_RESULT="success" EXIT_CODE="exited" EXIT_STATUS="0" INVOCATION_ID=""
+  export SERVICE_RESULT EXIT_CODE EXIT_STATUS INVOCATION_ID
+  main updates >/dev/null 2>&1 || rc=1
+  [[ ! -s $CASE_DIR/body ]] || {
+    printf '        the unchanged upgrade run was posted again after a unit failure\n'
+    rc=1
+  }
+  return $rc
+}
+
 test_updates_without_config_is_a_quiet_noop() {
   # A box that never configured Campfire must not log a complaint every day
   # just because the update run was clean (or its log was not there yet).
@@ -505,6 +613,7 @@ _t 'unknown command is rejected'                 test_unknown_command_is_rejecte
 _t 'unknown global option is rejected'           test_unknown_global_option_is_rejected
 _t 'send posts the text to the room'             test_send_posts_the_text_to_the_room
 _t 'send reads stdin'                            test_send_reads_stdin
+_t 'send - reads stdin'                          test_send_dash_reads_stdin
 _t 'send refuses an empty message'               test_send_refuses_an_empty_message
 _t 'send without config fails'                   test_send_without_config_fails
 _t 'invalid room and key are rejected'           test_invalid_room_and_key_are_rejected
@@ -521,6 +630,10 @@ _t 'every error line is kept'                    test_errors_keep_every_line
 _t 'systemd failure posts without a log'         test_systemd_failure_is_reported_even_without_a_log
 _t 'unit failure is silent on success'           test_unit_failure_is_silent_on_success
 _t 'apt-daily failure names stale lists'         test_apt_daily_failure_names_stale_lists
+_t 'updates dry run writes no state'             test_updates_dry_run_writes_no_state
+_t 'unit failure dry run writes no state'        test_unit_failure_dry_run_writes_no_state
+_t 'a reboot with no package changes posts once' test_reboot_only_is_reported_once
+_t 'unit failure keeps upgrade state separate'   test_unit_failure_does_not_clobber_upgrade_state
 _t 'updates without config is a quiet no-op'     test_updates_without_config_is_a_quiet_noop
 _t 'a change without config explains itself'     test_updates_change_without_config_is_a_quiet_noop
 _t 'configure writes 0600 and tests it'          test_configure_writes_a_0600_config_and_tests_it

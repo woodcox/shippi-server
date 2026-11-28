@@ -4672,7 +4672,24 @@ notify_warnings() {
     count=$((count + 1))
   done
 
-  if printf '%s\n' "$body" | "$reporter" send; then
+  local conf="${SHIPPI_CAMPFIRE_CONFIG:-/etc/shippi/campfire-notify.conf}"
+  local sent=0
+  if [[ -n ${SHIPPI_REPORT_BIN:-} || -n ${SHIPPI_CAMPFIRE_BOT_KEY:-} ||
+    ! -e $conf || -r $conf ]]; then
+    # A test override, an env-supplied key, or a config this user can already
+    # read needs no elevation. Running the reporter through run_root when it
+    # is not needed would add a sudo prompt to a warning summary.
+    if printf '%s\n' "$body" | "$reporter" send; then
+      sent=1
+    fi
+  elif printf '%s\n' "$body" | run_root "$reporter" send; then
+    # The default config is root-owned 0600. A normal user running
+    # `shippi-harden --notify` cannot read it, and the sudo ticket warmed at
+    # the start of the run is the intended way in.
+    sent=1
+  fi
+
+  if ((sent)); then
     ok "warning summary sent to Campfire"
     return 0
   fi

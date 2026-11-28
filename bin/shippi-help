@@ -250,8 +250,8 @@ page_hardening() {
   echo -e "  ${DIM}  The audit is skipped by default and offered again at the end of the run.${RESET}"
 
   section "Campfire reports"
-  cmd "shippi-report test"            "send a test message"
-  cmd "shippi-report updates --force" "send the latest update result now"
+  cmd "sudo shippi-report test"            "send a test message"
+  cmd "sudo shippi-report updates --force" "send the latest update result now"
   cmd "sudo shippi-report configure"  "store the Shippi bot key (mode 0600)"
   cmd "shippi-report --help"          "setup, config and command reference"
   echo -e "  ${DIM}  Update reports are automatic once configured: installed packages,${RESET}"

@@ -629,6 +629,39 @@ test_notify_warnings_is_silent_when_clean() {
   return $rc
 }
 
+test_notify_warnings_elevates_for_a_root_only_config() {
+  # The default config is root-owned 0600. A normal user running
+  # `shippi-harden --notify` cannot read it, so the summary has to go through
+  # the same sudo path the rest of the run uses. Root can read a 000 file, so
+  # the premise only holds for an unprivileged test runner.
+  [[ $(id -u) -ne 0 ]] || return 0
+  local rc=0 log="$TEST_TMP/notify-root.log"
+  local conf="$TEST_TMP/root-only-campfire.conf"
+  : >"$conf"
+  chmod 000 "$conf"
+  SHIPPI_CAMPFIRE_CONFIG="$conf"
+  SHIPPI_REPORT_BIN=""
+  stub report_bin
+  report_bin() { printf '%s\n' "$TEST_TMP/notifier"; }
+  stub run_root
+  run_root() {
+    printf 'run_root %s\n' "$*" >>"$log"
+    cat >>"$log"
+    return 0
+  }
+  WARNINGS=("a warning that needs root")
+  notify_warnings >/dev/null 2>&1 || rc=1
+  grep -q 'a warning that needs root' "$log" 2>/dev/null || {
+    printf '        the summary was not sent through run_root\n'
+    rc=1
+  }
+  chmod 600 "$conf"
+  SHIPPI_CAMPFIRE_CONFIG=""
+  WARNINGS=()
+  teardown_destdir
+  return $rc
+}
+
 test_notify_warnings_does_not_post_without_a_reporter() {
   # A missing shippi-report is a local deployment problem, not a reason to
   # claim the warning summary was sent.
@@ -5567,6 +5600,7 @@ t 'a dry run writes no Campfire files'                  test_dry_run_updates_doe
 t 'warn collects its warnings for --notify'             test_warn_calls_are_collected_for_notify
 t 'warning summaries are deduplicated'                  test_notify_warnings_sends_one_deduplicated_summary
 t 'a clean run has nothing to notify'                   test_notify_warnings_is_silent_when_clean
+t 'a root-only config uses the sudo path'               test_notify_warnings_elevates_for_a_root_only_config
 t 'no reporter is a failure, not a sent message'        test_notify_warnings_does_not_post_without_a_reporter
 t 'rpi origin survives the spaces in "Raspberry Pi Foundation"' test_rpi_origin_combo_keeps_the_spaced_origin
 t 'a half-read release line yields no origin'          test_rpi_origin_combo_rejects_a_half_read_release_line

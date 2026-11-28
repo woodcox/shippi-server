@@ -281,12 +281,18 @@ _state_file() {
 }
 
 _already_sent() {
+  # A dry run must not create the state directory just to decide whether a
+  # real run would have posted.
+  ((DRY_RUN)) && return 1
   local name="$1" key="$2" file
   file="$(_state_file "$name")" || return 1
   [[ -f $file ]] && [[ "$(cat "$file" 2>/dev/null || true)" == "$key" ]]
 }
 
 _mark_sent() {
+  # Likewise, previewing a report must not consume it: the next real
+  # invocation has to deliver it.
+  ((DRY_RUN)) && return 0
   local name="$1" key="$2" file tmp
   file="$(_state_file "$name")" || return 1
   tmp="${file}.tmp.$$"
@@ -365,12 +371,19 @@ _parse_last_upgrade() {
   printf '%s\n' "$parsed"
 }
 
+_reboot_flag() {
+  printf '%s\n' "${SHIPPI_REBOOT_REQUIRED:-/var/run/reboot-required}"
+}
+
 _reboot_note() {
-  [[ -e /var/run/reboot-required ]] || return 0
+  local flag pkgs_file
+  flag="$(_reboot_flag)"
+  [[ -e $flag ]] || return 0
+  pkgs_file="${SHIPPI_REBOOT_REQUIRED_PKGS:-/var/run/reboot-required.pkgs}"
   local pkgs=""
-  if [[ -r /var/run/reboot-required.pkgs ]]; then
+  if [[ -r $pkgs_file ]]; then
     pkgs="$(awk 'NF && !seen[$0]++ { printf "%s%s", sep, $0; sep = " " }' \
-      /var/run/reboot-required.pkgs 2>/dev/null || true)"
+      "$pkgs_file" 2>/dev/null || true)"
   fi
   if [[ -n $pkgs ]]; then
     printf 'Reboot required (%s).\n' "$pkgs"
@@ -387,7 +400,10 @@ _report_unit_failure() {
   local invocation="$5" force="$6" key body detail errors=""
   key="unit:${unit}:${invocation:-${result}:${exit_status}}"
 
-  if ((!force)) && _already_sent updates "$key"; then
+  # A unit failure and an upgrade run are different reports. Sharing
+  # updates.state meant a daily apt-daily failure overwrote the run key and
+  # the unchanged upgrade log was posted again.
+  if ((!force)) && _already_sent unit-failures "$key"; then
     note "${unit} failure already reported"
     return 0
   fi
@@ -421,7 +437,7 @@ _report_unit_failure() {
   fi
 
   printf '%s\n' "$body" | _campfire_post || return 1
-  _mark_sent updates "$key" || true
+  _mark_sent unit-failures "$key" || true
 }
 
 _updates_result() {
@@ -468,10 +484,32 @@ cmd_updates() {
   local removed="${fields[3]:-}" kept="${fields[4]:-}" errors="${fields[5]:-}"
   errors="${errors%$'\n'}"
 
-  # A clean run is not news. Do not write state either: if the same run is
-  # re-read after a rotation or a manual invocation it is still clean, and
-  # a changed run is the only case that must not be repeated.
+  local reboot body
+  reboot="$(_reboot_note || true)"
+
+  # A clean run with no pending reboot is not news. Do not write state either:
+  # if the same run is re-read after a rotation or a manual invocation it is
+  # still clean, and a changed run is the only case that must not be repeated.
   if [[ $state == none ]]; then
+    [[ -n $reboot ]] || return 0
+
+    # A reboot can be pending after a manual upgrade that installed no
+    # packages unattended, so it is an issue on its own. Key the dedupe on the
+    # flag's mtime: a new kernel that requests a new reboot moves it.
+    local flag reboot_key
+    flag="$(_reboot_flag)"
+    reboot_key="reboot:$(stat -c %Y "$flag" 2>/dev/null || echo unknown)"
+    if ((!force)) && _already_sent reboot "$reboot_key"; then
+      note "the pending reboot was already reported"
+      return 0
+    fi
+    if ! _config_load; then
+      note "Campfire reporting is not configured; nothing sent"
+      return 0
+    fi
+    body="$(_hostname) — no package changes"$'\n'"$reboot"
+    printf '%s\n' "$body" | _campfire_post || return 1
+    _mark_sent reboot "$reboot_key" || true
     return 0
   fi
 
@@ -487,7 +525,7 @@ cmd_updates() {
   fi
 
   local when="${start%% INFO *}"
-  local body="$(_hostname) — unattended upgrades ${when}"
+  body="$(_hostname) — unattended upgrades ${when}"
   if [[ -n $pkg ]]; then
     body+=$'\n'"Installed: ${pkg}"
   fi
@@ -500,8 +538,6 @@ cmd_updates() {
   if [[ -n $errors ]]; then
     body+=$'\n'"Errors:"$'\n'"$errors"
   fi
-  local reboot
-  reboot="$(_reboot_note || true)"
   [[ -n $reboot ]] && body+=$'\n'"$reboot"
 
   printf '%s\n' "$body" | _campfire_post || return 1
@@ -551,7 +587,15 @@ cmd_unit_failure() {
 # ---------------------------------------------------------------------------
 cmd_send() {
   local text=""
-  if (($#)); then
+  if (($# == 1)) && [[ ${1:-} == - ]]; then
+    # The usage documents `send -` as explicit stdin. Without this branch a
+    # pipe posts the literal "-".
+    if [[ -t 0 ]]; then
+      error "send - needs a message on stdin"
+      return 2
+    fi
+    text="$(cat)"
+  elif (($#)); then
     text="$*"
   else
     if [[ -t 0 ]]; then

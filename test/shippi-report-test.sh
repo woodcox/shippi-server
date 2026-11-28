@@ -107,6 +107,11 @@ setup() {
   # The fake curl is a child process, so these have to cross the fork.
   export SHIPPI_CURL_BODY SHIPPI_CURL_ARGS SHIPPI_CURL_STATUS
   export SHIPPI_CURL_EXIT SHIPPI_CURL_URL
+  # The lock test runs the script as a subprocess, so the config, log, state
+  # and fake curl have to cross the fork too.
+  export SHIPPI_CURL="$CURL_BIN"
+  export SHIPPI_CAMPFIRE_CONFIG="$CONFIG"
+  export SHIPPI_UNATTENDED_LOG SHIPPI_REPORT_STATE_DIR
   DRY_RUN=0
   MAX_CHARS=6000
   # _config_load treats these as environment overrides, so a value left over
@@ -508,6 +513,30 @@ EOF
   return $rc
 }
 
+test_executed_updates_serializes_through_a_lock() {
+  # The in-process tests call main() directly. This is the one that proves the
+  # real executable path re-execs under flock, so two overlapping hooks cannot
+  # both post the same run.
+  command -v flock >/dev/null 2>&1 || return 0
+  setup lock
+  cat >"$SHIPPI_UNATTENDED_LOG" <<'EOF'
+2026-11-28 06:00:00,000 INFO Starting unattended upgrades script
+2026-11-28 06:00:01,000 INFO Packages that will be upgraded: bash
+2026-11-28 06:00:02,000 INFO All upgrades installed
+EOF
+  local rc=0
+  "$SCRIPT" --config "$CONFIG" updates >/dev/null 2>&1 || rc=1
+  [[ -e $SHIPPI_REPORT_STATE_DIR/report.lock ]] || {
+    printf '        the executed updates command did not take the lock\n'
+    rc=1
+  }
+  [[ -s $CASE_DIR/body ]] || {
+    printf '        the executed updates command did not post\n'
+    rc=1
+  }
+  return $rc
+}
+
 test_updates_without_config_is_a_quiet_noop() {
   # A box that never configured Campfire must not log a complaint every day
   # just because the update run was clean (or its log was not there yet).
@@ -634,6 +663,7 @@ _t 'updates dry run writes no state'             test_updates_dry_run_writes_no_
 _t 'unit failure dry run writes no state'        test_unit_failure_dry_run_writes_no_state
 _t 'a reboot with no package changes posts once' test_reboot_only_is_reported_once
 _t 'unit failure keeps upgrade state separate'   test_unit_failure_does_not_clobber_upgrade_state
+_t 'executed updates runs under a lock'          test_executed_updates_serializes_through_a_lock
 _t 'updates without config is a quiet no-op'     test_updates_without_config_is_a_quiet_noop
 _t 'a change without config explains itself'     test_updates_change_without_config_is_a_quiet_noop
 _t 'configure writes 0600 and tests it'          test_configure_writes_a_0600_config_and_tests_it

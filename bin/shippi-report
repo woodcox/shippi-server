@@ -720,6 +720,7 @@ cmd_configure() {
 
 main() {
   local command="" args=()
+  local -a original=("$@")
   while (($#)); do
     case "$1" in
       --config)
@@ -765,6 +766,25 @@ main() {
   if [[ -z $command ]]; then
     usage >&2
     return 2
+  fi
+
+  # Serialize the state check, POST and state write for the reporting
+  # commands. Two overlapping runs could both read "not sent" before either
+  # records the key, and the POST can take up to 20 seconds. Re-exec under
+  # flock so the lock covers the whole decision and delivery.
+  #
+  # Sourced callers (the test suite) skip this: $0 is the test runner, not
+  # this script.
+  if [[ -z ${SHIPPI_REPORT_LOCKED:-} ]] && ((!DRY_RUN)) &&
+    [[ ${BASH_SOURCE[0]} == "${0}" ]] &&
+    [[ $command == updates || $command == unit-failure ]] &&
+    command -v flock >/dev/null 2>&1; then
+    local lockdir lock
+    lockdir="$(_state_dir)" || return 1
+    lock="${lockdir}/report.lock"
+    export SHIPPI_REPORT_LOCKED=1
+    flock -w 60 "$lock" "$0" "${original[@]}"
+    return $?
   fi
 
   case "$command" in

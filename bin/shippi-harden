@@ -4699,7 +4699,7 @@ _notify_warnings() {
     if [[ -x /usr/local/sbin/shippi-report ]]; then
       root_reporter="/usr/local/sbin/shippi-report"
     fi
-    if printf '%s\n' "$body" | run_root "$root_reporter" send; then
+    if printf '%s\n' "$body" | run_root "$root_reporter" --config "$conf" send; then
       sent=1
     fi
   fi

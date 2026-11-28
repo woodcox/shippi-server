@@ -655,6 +655,10 @@ test_notify_warnings_elevates_for_a_root_only_config() {
     printf '        the summary was not sent through run_root\n'
     rc=1
   }
+  grep -q -- '--config' "$log" 2>/dev/null || {
+    printf '        the selected config was not passed through run_root\n'
+    rc=1
+  }
   chmod 600 "$conf"
   SHIPPI_CAMPFIRE_CONFIG=""
   WARNINGS=()

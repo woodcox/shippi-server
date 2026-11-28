@@ -223,12 +223,15 @@ test_invalid_room_and_key_are_rejected() {
 
 test_world_writable_config_is_refused() {
   # The config is sourced, so a group-/world-writable file would run its
-  # contents as root on the next systemd hook. Refuse it before sourcing.
+  # contents as root on the next systemd hook. Refuse it before sourcing. A
+  # leading setuid/setgid/sticky digit must not hide the group/other write bits.
   setup world-writable
-  chmod 666 "$CONFIG"
-  local rc=0 out
-  out="$(main send "hello" 2>&1)" && rc=1
-  assert_contains "$out" "world-writable" || rc=1
+  local rc=0 out mode
+  for mode in 666 1002; do
+    chmod "$mode" "$CONFIG"
+    out="$(main send "hello" 2>&1)" && rc=1
+    assert_contains "$out" "world-writable" || rc=1
+  done
   [[ ! -e $CASE_DIR/body ]] || {
     printf '        a rejected config still reached curl\n'
     rc=1
@@ -392,9 +395,9 @@ EOF
   return $rc
 }
 
-test_failed_upgrade_names_what_was_installed() {
-  # A failed run still names what it installed before the error, not just the
-  # error lines.
+test_failed_upgrade_names_packages_to_upgrade() {
+  # The "will be upgraded" list is a plan, not a completion, so a failed run
+  # must label it "to upgrade", never "Installed".
   setup failed-with-packages
   cat >"$SHIPPI_UNATTENDED_LOG" <<'EOF'
 2026-11-28 06:00:00,000 INFO Starting unattended upgrades script
@@ -406,7 +409,11 @@ EOF
   local rc=0 body
   main updates >/dev/null 2>&1 || rc=1
   body="$(cat "$CASE_DIR/body" 2>/dev/null)"
-  assert_contains "$body" "Installed: bash" || rc=1
+  assert_contains "$body" "Packages to upgrade: bash" || rc=1
+  [[ $body != *"Installed: bash"* ]] || {
+    printf '        a failed run claimed the packages were installed\n'
+    rc=1
+  }
   assert_contains "$body" "could not acquire the apt lock" || rc=1
   return $rc
 }
@@ -508,12 +515,57 @@ EOF
   local rc=0 body
   main updates >/dev/null 2>&1 || rc=1
   body="$(cat "$CASE_DIR/body" 2>/dev/null)"
-  assert_contains "$body" "no package changes" || rc=1
   assert_contains "$body" "Reboot required (linux-image-test)" || rc=1
+  [[ $body != *"Installed"* ]] || {
+    printf '        the reboot-only report also claimed packages\n'
+    rc=1
+  }
   : >"$CASE_DIR/body"
   main updates >/dev/null 2>&1 || rc=1
   [[ ! -s $CASE_DIR/body ]] || {
     printf '        the pending reboot was reported twice\n'
+    rc=1
+  }
+  return $rc
+}
+
+test_reboot_is_reported_without_an_upgrade_run() {
+  # The log may not exist yet (no unattended-upgrades run), but a pending
+  # reboot is still an issue on its own.
+  setup reboot-no-log
+  rm -f "$SHIPPI_UNATTENDED_LOG"
+  printf 'linux-image-test\n' >"$SHIPPI_REBOOT_REQUIRED_PKGS"
+  : >"$SHIPPI_REBOOT_REQUIRED"
+  local rc=0 body
+  main updates >/dev/null 2>&1 || rc=1
+  body="$(cat "$CASE_DIR/body" 2>/dev/null)"
+  assert_contains "$body" "Reboot required (linux-image-test)" || rc=1
+  return $rc
+}
+
+test_new_reboot_posts_after_upgrade_already_reported() {
+  # The package run was already reported; a reboot that became pending since
+  # then must not be suppressed by the unchanged run key.
+  setup new-reboot-after-report
+  cat >"$SHIPPI_UNATTENDED_LOG" <<'EOF'
+2026-11-27 06:14:24,810 INFO Starting unattended upgrades script
+2026-11-27 06:14:28,553 INFO Packages that will be upgraded: bash
+2026-11-27 06:14:33,155 INFO All upgrades installed
+EOF
+  local rc=0 body
+  main updates >/dev/null 2>&1 || rc=1
+  body="$(cat "$CASE_DIR/body" 2>/dev/null)"
+  assert_contains "$body" "Installed: bash" || rc=1
+  : >"$CASE_DIR/body"
+
+  printf 'linux-image-test\n' >"$SHIPPI_REBOOT_REQUIRED_PKGS"
+  : >"$SHIPPI_REBOOT_REQUIRED"
+
+  main updates >/dev/null 2>&1 || rc=1
+  body="$(cat "$CASE_DIR/body" 2>/dev/null)"
+  assert_contains "$body" "Reboot required (linux-image-test)" || rc=1
+  [[ $body != *"Installed: bash"* ]] || {
+    printf '        the already-reported package run was posted again\n'
     rc=1
   }
   return $rc
@@ -685,13 +737,15 @@ _t 'unit failure is silent on success'           test_unit_failure_is_silent_on_
 _t 'apt-daily failure names stale lists'         test_apt_daily_failure_names_stale_lists
 _t 'updates dry run writes no state'             test_updates_dry_run_writes_no_state
 _t 'unit failure dry run writes no state'        test_unit_failure_dry_run_writes_no_state
-_t 'a reboot with no package changes posts once' test_reboot_only_is_reported_once
-_t 'unit failure keeps upgrade state separate'   test_unit_failure_does_not_clobber_upgrade_state
+_t 'a pending reboot posts once'                  test_reboot_only_is_reported_once
+_t 'a reboot posts with no upgrade run yet'       test_reboot_is_reported_without_an_upgrade_run
+_t 'a new reboot posts after the run was reported' test_new_reboot_posts_after_upgrade_already_reported
+_t 'unit failure keeps upgrade state separate'    test_unit_failure_does_not_clobber_upgrade_state
 _t 'executed updates runs under a lock'          test_executed_updates_serializes_through_a_lock
 _t 'updates without config is a quiet no-op'     test_updates_without_config_is_a_quiet_noop
 _t 'a change without config explains itself'     test_updates_change_without_config_is_a_quiet_noop
 _t 'a world-writable config is refused'          test_world_writable_config_is_refused
-_t 'a failed upgrade names what it installed'    test_failed_upgrade_names_what_was_installed
+_t 'a failed upgrade names packages to upgrade'   test_failed_upgrade_names_packages_to_upgrade
 _t 'unit failures do not clobber each other'     test_unit_failures_do_not_clobber_each_other
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAIL"

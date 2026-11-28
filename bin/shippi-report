@@ -133,7 +133,7 @@ _config_load() {
     # file would let any local user run code as root on the next update.
     local mode
     mode="$(stat -c %a "$CONFIG" 2>/dev/null || true)"
-    if [[ -n $mode ]] && [[ ${mode:1:1}${mode:2:1} =~ [2367] ]]; then
+    if [[ -n $mode ]] && (( 8#$mode & 022 )); then
       error "refusing to use ${CONFIG}: group- or world-writable (mode ${mode}); run: chmod 600 ${CONFIG}"
       return 1
     fi
@@ -397,6 +397,28 @@ _reboot_note() {
   fi
 }
 
+# A reboot can be pending after a manual upgrade that installed no packages
+# unattended, so it is an issue on its own, independent of the package report.
+# Key the dedupe on the flag's mtime: a new kernel that requests a new reboot
+# moves it.
+_report_pending_reboot() {
+  local reboot="$1" force="$2"
+  [[ -n $reboot ]] || return 0
+  local flag reboot_key
+  flag="$(_reboot_flag)"
+  reboot_key="reboot:$(stat -c %Y "$flag" 2>/dev/null || echo unknown)"
+  if ((!force)) && _already_sent reboot "$reboot_key"; then
+    note "the pending reboot was already reported"
+    return 0
+  fi
+  if ! _config_load; then
+    note "Campfire reporting is not configured; nothing sent"
+    return 0
+  fi
+  printf '%s\n' "$(_hostname) — ${reboot%$'\n'}" | _campfire_post || return 1
+  _mark_sent reboot "$reboot_key" || true
+}
+
 # One message for a failed unit. The invocation id, when systemd supplies
 # one, is the deduplication key: the same failure is not posted twice when
 # the unit is stopped again or the hook is retried.
@@ -441,7 +463,9 @@ _report_unit_failure() {
       errors="${fields[5]:-}"
       errors="${errors%$'\n'}"
       if [[ -n $pkg ]]; then
-        body+=$'\n'"Installed: ${pkg}"
+        # The "will be upgraded" list is a plan, not a completion, so a failed
+        # run must not claim these were installed.
+        body+=$'\n'"Packages to upgrade: ${pkg}"
       fi
       if [[ -n $removed ]]; then
         body+=$'\n'"Auto-removed: ${removed}"
@@ -493,6 +517,13 @@ cmd_updates() {
     return
   fi
 
+  # A reboot is reported independently of the package run: a manual upgrade can
+  # create the flag without changing the unattended-upgrades log, and the run
+  # that already posted the packages must not suppress the newer reboot.
+  local reboot
+  reboot="$(_reboot_note || true)"
+  _report_pending_reboot "$reboot" "$force" || return 1
+
   parsed="$(_parse_last_upgrade)" || {
     note "no unattended-upgrades run found in ${SHIPPI_UNATTENDED_LOG:-$UPGRADE_LOG}; nothing sent"
     return 0
@@ -503,32 +534,10 @@ cmd_updates() {
   local removed="${fields[3]:-}" kept="${fields[4]:-}" errors="${fields[5]:-}"
   errors="${errors%$'\n'}"
 
-  local reboot body
-  reboot="$(_reboot_note || true)"
-
-  # A clean run with no pending reboot is not news. Do not write state either:
-  # if the same run is re-read after a rotation or a manual invocation it is
-  # still clean, and a changed run is the only case that must not be repeated.
+  # A clean run with no package changes is not news (the reboot, if any, was
+  # already handled above). Do not write state: a changed run is the only case
+  # that must not be repeated.
   if [[ $state == none ]]; then
-    [[ -n $reboot ]] || return 0
-
-    # A reboot can be pending after a manual upgrade that installed no
-    # packages unattended, so it is an issue on its own. Key the dedupe on the
-    # flag's mtime: a new kernel that requests a new reboot moves it.
-    local flag reboot_key
-    flag="$(_reboot_flag)"
-    reboot_key="reboot:$(stat -c %Y "$flag" 2>/dev/null || echo unknown)"
-    if ((!force)) && _already_sent reboot "$reboot_key"; then
-      note "the pending reboot was already reported"
-      return 0
-    fi
-    if ! _config_load; then
-      note "Campfire reporting is not configured; nothing sent"
-      return 0
-    fi
-    body="$(_hostname) — no package changes"$'\n'"$reboot"
-    printf '%s\n' "$body" | _campfire_post || return 1
-    _mark_sent reboot "$reboot_key" || true
     return 0
   fi
 
@@ -543,7 +552,8 @@ cmd_updates() {
     return 0
   fi
 
-  local when="${start%% INFO *}"
+  local when body
+  when="${start%% INFO *}"
   body="$(_hostname) — unattended upgrades ${when}"
   if [[ -n $pkg ]]; then
     body+=$'\n'"Installed: ${pkg}"
@@ -557,7 +567,6 @@ cmd_updates() {
   if [[ -n $errors ]]; then
     body+=$'\n'"Errors:"$'\n'"$errors"
   fi
-  [[ -n $reboot ]] && body+=$'\n'"$reboot"
 
   printf '%s\n' "$body" | _campfire_post || return 1
   _mark_sent updates "$key" || true
